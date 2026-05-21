@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Messages - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="MessagesController" ng-init="loadInbox()">
+    <div class="page-header">
+        <h1>Inbox <span ng-if="unreadCount > 0" class="badge">(( unreadCount ))</span></h1>
+        <a href="/messages/compose" class="btn btn-primary">Compose Message</a>
+    </div>
+    
+    <div ng-if="loading" class="loading">Loading messages...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div ng-if="messages.length === 0 && !loading" class="empty-state">
+        <p>No messages yet.</p>
+    </div>
+    
+    <div class="messages-list">
+        <div ng-repeat="message in messages" class="message-item" ng-class="{'unread': !message.is_read}">
+            <div class="message-header">
+                <strong>From: <a href="/users/(( message.sender.username ))">(( message.sender.username ))</a></strong>
+                <span class="message-date">(( message.created_at | date:'short' ))</span>
+            </div>
+            <div class="message-subject" ng-if="message.subject">
+                <strong>(( message.subject ))</strong>
+            </div>
+            <p class="message-preview">(( message.content.substring(0, 100) ))(( message.content.length > 100 ? '...' : '' ))</p>
+            <div class="message-actions">
+                <button ng-click="markAsRead(message.id)" ng-if="!message.is_read" class="btn btn-sm">Mark as Read</button>
+                <button ng-click="deleteMessage(message.id)" class="btn btn-sm btn-danger">Delete</button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/messages.controller.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}User Profile - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="UsersController" ng-init="loadUser('{{ request.view_args.username }}'); loadUserPosts('{{ request.view_args.username }}')">
+    <div ng-if="loading" class="loading">Loading profile...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div ng-if="user" class="profile-container">
+        <div class="profile-header">
+            <img ng-if="user.avatar_url" ng-src="(( user.avatar_url ))" alt="(( user.username ))" class="avatar-large">
+            <div ng-if="!user.avatar_url" class="avatar-placeholder">(( user.username.charAt(0).toUpperCase() ))</div>
+            
+            <div class="profile-info">
+                <h1>(( user.username ))</h1>
+                <p ng-if="user.bio">(( user.bio ))</p>
+                <p class="profile-meta">Member since (( user.created_at | date:'mediumDate' ))</p>
+                
+                <div class="profile-stats">
+                    <span>(( stats.posts_count )) posts</span>
+                    <span>(( stats.followers_count )) followers</span>
+                    <span>(( stats.following_count )) following</span>
+                </div>
+                
+                <div class="profile-actions">
+                    <button ng-click="followUser(user.username)" class="btn btn-primary">Follow</button>
+                    <button ng-click="unfollowUser(user.username)" class="btn">Unfollow</button>
+                    <a href="/messages/compose" class="btn">Send Message</a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="profile-posts">
+            <h2>Posts by (( user.username ))</h2>
+            
+            <div ng-if="userPosts.length === 0" class="empty-state">
+                <p>No posts yet.</p>
+            </div>
+            
+            <div class="posts-list">
+                <div ng-repeat="post in userPosts" class="post-card">
+                    <h3><a href="/posts/(( post.id ))">(( post.title ))</a></h3>
+                    <div class="post-meta">
+                        <span>(( post.created_at | date:'short' ))</span>
+                    </div>
+                    <p class="post-excerpt">(( post.content.substring(0, 150) ))(( post.content.length > 150 ? '...' : '' ))</p>
+                    <div class="post-tags">
+                        <span ng-repeat="tag in post.tags" class="tag">(( tag.name ))</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/users.controller.js') }}"></script>
+{% endblock %}

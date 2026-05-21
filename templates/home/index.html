@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}Home - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="HomeController">
+    <div class="page-header">
+        <h1>Welcome back, (( currentUser.username || '{{ current_user.username }}' ))!</h1>
+        <p class="user-id-display">User ID: {{ user_id }}</p>
+    </div>
+    
+    <div class="home-dashboard">
+        <div class="dashboard-section">
+            <h2>Your Activity</h2>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <h3>(( stats.posts_count || 0 ))</h3>
+                    <p>Posts</p>
+                    <a href="/posts/create" class="btn btn-sm btn-primary">Create New Post</a>
+                </div>
+                <div class="stat-card">
+                    <h3>(( stats.followers_count || 0 ))</h3>
+                    <p>Followers</p>
+                </div>
+                <div class="stat-card">
+                    <h3>(( stats.following_count || 0 ))</h3>
+                    <p>Following</p>
+                </div>
+                <div class="stat-card">
+                    <h3>(( unreadMessages || 0 ))</h3>
+                    <p>Unread Messages</p>
+                    <a href="/messages" class="btn btn-sm">View Messages</a>
+                </div>
+            </div>
+        </div>
+        
+        <div class="dashboard-section">
+            <h2>Recent Posts</h2>
+            <div ng-if="loading" class="loading">Loading...</div>
+            <div ng-if="recentPosts.length === 0 && !loading" class="empty-state">
+                <p>You haven't created any posts yet.</p>
+                <a href="/posts/create" class="btn btn-primary">Create Your First Post</a>
+            </div>
+            <div class="posts-list">
+                <div ng-repeat="post in recentPosts" class="post-card">
+                    <h3><a href="/posts/(( post.id ))">(( post.title ))</a></h3>
+                    <div class="post-meta">
+                        <span>(( post.created_at | date:'short' ))</span>
+                        <span>(( post.reply_count )) replies</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="dashboard-section">
+            <h2>Quick Links</h2>
+            <div class="quick-links">
+                <a href="/feed" class="quick-link-card">
+                    <h3>My Feed</h3>
+                    <p>Posts from your favorited tags</p>
+                </a>
+                <a href="/tags" class="quick-link-card">
+                    <h3>Browse Tags</h3>
+                    <p>Discover and favorite tags</p>
+                </a>
+                <a href="/posts" class="quick-link-card">
+                    <h3>All Posts</h3>
+                    <p>Browse all blog posts</p>
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/home.controller.js') }}"></script>
+{% endblock %}

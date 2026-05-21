@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="SettingsController">
+    <div class="page-header">
+        <h1>Settings</h1>
+    </div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    <div ng-if="success" class="success-message">(( success ))</div>
+    
+    <div class="settings-container">
+        <div class="settings-section">
+            <h2>Profile Information</h2>
+            <form ng-submit="updateProfile()" class="settings-form">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input 
+                        type="text" 
+                        id="username" 
+                        ng-model="profile.username" 
+                        required 
+                        class="form-control">
+                </div>
+                
+                <div class="form-group">
+                    <label for="email">Email</label>
+                    <input 
+                        type="email" 
+                        id="email" 
+                        ng-model="profile.email" 
+                        required 
+                        class="form-control">
+                </div>
+                
+                <div class="form-group">
+                    <label for="bio">Bio</label>
+                    <textarea 
+                        id="bio" 
+                        ng-model="profile.bio" 
+                        rows="4" 
+                        class="form-control"></textarea>
+                </div>
+                
+                <div class="form-group">
+                    <label for="avatar_url">Avatar URL</label>
+                    <input 
+                        type="url" 
+                        id="avatar_url" 
+                        ng-model="profile.avatar_url" 
+                        class="form-control">
+                </div>
+                
+                <button type="submit" class="btn btn-primary" ng-disabled="loading">
+                    <span ng-if="!loading">Save Changes</span>
+                    <span ng-if="loading">Saving...</span>
+                </button>
+            </form>
+        </div>
+        
+        <div class="settings-section">
+            <h2>Change Password</h2>
+            <form ng-submit="changePassword()" class="settings-form">
+                <div class="form-group">
+                    <label for="current_password">Current Password</label>
+                    <input 
+                        type="password" 
+                        id="current_password" 
+                        ng-model="passwordData.current_password" 
+                        required 
+                        class="form-control">
+                </div>
+                
+                <div class="form-group">
+                    <label for="new_password">New Password</label>
+                    <input 
+                        type="password" 
+                        id="new_password" 
+                        ng-model="passwordData.new_password" 
+                        required 
+                        class="form-control">
+                </div>
+                
+                <div class="form-group">
+                    <label for="confirm_password">Confirm New Password</label>
+                    <input 
+                        type="password" 
+                        id="confirm_password" 
+                        ng-model="passwordData.confirm_password" 
+                        required 
+                        class="form-control">
+                </div>
+                
+                <button type="submit" class="btn btn-primary" ng-disabled="loading">
+                    <span ng-if="!loading">Change Password</span>
+                    <span ng-if="loading">Changing...</span>
+                </button>
+            </form>
+        </div>
+        
+        <div class="settings-section">
+            <h2>Favorite Tags</h2>
+            <div ng-if="favoriteTags.length === 0" class="empty-state">
+                <p>You haven't favorited any tags yet.</p>
+                <a href="/tags" class="btn btn-primary">Browse Tags</a>
+            </div>
+            <div class="tags-list">
+                <span ng-repeat="tag in favoriteTags" class="tag">(( tag.name ))</span>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/settings.controller.js') }}"></script>
+{% endblock %}

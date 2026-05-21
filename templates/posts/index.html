@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}All Posts - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="PostsController" ng-init="loadPosts()">
+    <div class="page-header">
+        <h1>All Posts</h1>
+        <a href="/posts/create" class="btn btn-primary">Create Post</a>
+    </div>
+    
+    <div ng-if="loading" class="loading">Loading posts...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div class="posts-list">
+        <div ng-repeat="post in posts" class="post-card">
+            <h2><a href="/posts/(( post.id ))">(( post.title ))</a></h2>
+            <div class="post-meta">
+                <span>By <a href="/users/(( post.author.username ))">(( post.author.username ))</a></span>
+                <span>(( post.created_at | date:'short' ))</span>
+            </div>
+            <p class="post-excerpt">(( post.content.substring(0, 200) ))(( post.content.length > 200 ? '...' : '' ))</p>
+            <div class="post-tags">
+                <span ng-repeat="tag in post.tags" class="tag">(( tag.name ))</span>
+            </div>
+            <div class="post-stats">
+                <span>(( post.reply_count )) replies</span>
+                <span>(( post.saved_count )) saves</span>
+            </div>
+        </div>
+    </div>
+    
+    <div class="pagination" ng-if="totalPages > 1">
+        <button ng-click="prevPage()" ng-disabled="page === 1" class="btn">Previous</button>
+        <span>Page (( page )) of (( totalPages ))</span>
+        <button ng-click="nextPage()" ng-disabled="page === totalPages" class="btn">Next</button>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/posts.controller.js') }}"></script>
+{% endblock %}

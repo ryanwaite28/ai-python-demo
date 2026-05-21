@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block title %}Post - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="PostsController" ng-init="loadPost({{ request.view_args.post_id }})">
+    <div ng-if="loading" class="loading">Loading post...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div ng-if="currentPost" class="post-detail">
+        <h1>(( currentPost.title ))</h1>
+        
+        <div class="post-meta">
+            <span>By <a href="/users/(( currentPost.author.username ))">(( currentPost.author.username ))</a></span>
+            <span>(( currentPost.created_at | date:'medium' ))</span>
+        </div>
+        
+        <div class="post-content">
+            <p>(( currentPost.content ))</p>
+        </div>
+        
+        <div class="post-tags">
+            <span ng-repeat="tag in currentPost.tags" class="tag">(( tag.name ))</span>
+        </div>
+        
+        <div class="post-actions">
+            <button ng-click="savePost(currentPost.id)" class="btn">Save Post</button>
+            <a href="/posts/(( currentPost.id ))/edit" class="btn">Edit</a>
+            <button ng-click="deletePost(currentPost.id)" class="btn btn-danger">Delete</button>
+        </div>
+        
+        <div class="replies-section">
+            <h2>Replies ((replies.length))</h2>
+            
+            <form ng-submit="addReply(currentPost.id, {content: replyContent})" class="reply-form">
+                <textarea 
+                    ng-model="replyContent" 
+                    placeholder="Write a reply..." 
+                    rows="3" 
+                    class="form-control" 
+                    required></textarea>
+                <button type="submit" class="btn btn-primary">Add Reply</button>
+            </form>
+            
+            <div ng-repeat="reply in replies" class="reply">
+                <div class="reply-author">
+                    <a href="/users/(( reply.author.username ))">(( reply.author.username ))</a>
+                    <span class="reply-date">(( reply.created_at | date:'short' ))</span>
+                </div>
+                <p class="reply-content">(( reply.content ))</p>
+                
+                <div ng-if="reply.replies && reply.replies.length > 0" class="nested-replies">
+                    <div ng-repeat="nestedReply in reply.replies" class="reply nested">
+                        <div class="reply-author">
+                            <a href="/users/(( nestedReply.author.username ))">(( nestedReply.author.username ))</a>
+                            <span class="reply-date">(( nestedReply.created_at | date:'short' ))</span>
+                        </div>
+                        <p class="reply-content">(( nestedReply.content ))</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/posts.controller.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+
+{% block title %}Tags - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="TagsController" ng-init="loadTags(true)">
+    <div class="page-header">
+        <h1>Browse Tags</h1>
+    </div>
+    
+    <div class="tags-filter">
+        <button ng-click="loadTags(true)" class="btn">Popular Tags</button>
+        <button ng-click="loadTags(false)" class="btn">All Tags</button>
+        <button ng-click="loadFavoriteTags()" class="btn">My Favorites</button>
+    </div>
+    
+    <div ng-if="loading" class="loading">Loading tags...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div class="tags-grid">
+        <div ng-repeat="tag in tags" class="tag-card">
+            <h3><a href="/tags/(( tag.name ))">(( tag.name ))</a></h3>
+            <p class="tag-stats">(( tag.post_count )) posts</p>
+            <div class="tag-actions">
+                <button ng-click="favoriteTag(tag.id)" ng-if="!tag.favorited" class="btn btn-sm">Favorite</button>
+                <button ng-click="unfavoriteTag(tag.id)" ng-if="tag.favorited" class="btn btn-sm">Unfavorite</button>
+            </div>
+        </div>
+    </div>
+    
+    <div ng-if="favoriteTags.length > 0" class="favorite-tags-section">
+        <h2>Your Favorite Tags</h2>
+        <div class="tags-list">
+            <span ng-repeat="tag in favoriteTags" class="tag">(( tag.name ))</span>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/tags.controller.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Search - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="TagsController">
+    <div class="page-header">
+        <h1>Search Posts by Tags</h1>
+    </div>
+    
+    <div class="search-form">
+        <form ng-submit="searchByTags(searchTags, matchType)">
+            <div class="form-group">
+                <label for="search-tags">Tags (comma-separated)</label>
+                <input 
+                    type="text" 
+                    id="search-tags" 
+                    ng-model="searchTags" 
+                    placeholder="e.g., javascript, python, web-dev" 
+                    class="form-control">
+            </div>
+            
+            <div class="form-group">
+                <label>Match Type</label>
+                <label>
+                    <input type="radio" ng-model="matchType" value="all"> Match all tags
+                </label>
+                <label>
+                    <input type="radio" ng-model="matchType" value="any"> Match any tag
+                </label>
+            </div>
+            
+            <button type="submit" class="btn btn-primary" ng-disabled="loading">Search</button>
+        </form>
+    </div>
+    
+    <div ng-if="loading" class="loading">Searching...</div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <div ng-if="searchResults.length > 0" class="search-results">
+        <h2>Search Results ((searchResults.length))</h2>
+        
+        <div class="posts-list">
+            <div ng-repeat="post in searchResults" class="post-card">
+                <h3><a href="/posts/(( post.id ))">(( post.title ))</a></h3>
+                <div class="post-meta">
+                    <span>By <a href="/users/(( post.author.username ))">(( post.author.username ))</a></span>
+                    <span>(( post.created_at | date:'short' ))</span>
+                </div>
+                <p class="post-excerpt">(( post.content.substring(0, 200) ))(( post.content.length > 200 ? '...' : '' ))</p>
+                <div class="post-tags">
+                    <span ng-repeat="tag in post.tags" class="tag">(( tag.name ))</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <div ng-if="searchResults.length === 0 && !loading && searchTags" class="empty-state">
+        <p>No posts found matching your search.</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/tags.controller.js') }}"></script>
+{% endblock %}

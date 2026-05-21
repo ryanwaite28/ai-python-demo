@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+
+{% block title %}Create Post - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="PostsController">
+    <div class="page-header">
+        <h1>Create New Post</h1>
+    </div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <form ng-submit="createPost(postData)" class="post-form">
+        <div class="form-group">
+            <label for="title">Title</label>
+            <input 
+                type="text" 
+                id="title" 
+                ng-model="postData.title" 
+                required 
+                class="form-control">
+        </div>
+        
+        <div class="form-group">
+            <label for="content">Content</label>
+            <textarea 
+                id="content" 
+                ng-model="postData.content" 
+                rows="10" 
+                required 
+                class="form-control"></textarea>
+        </div>
+        
+        <div class="form-group">
+            <label for="tags">Tags (comma-separated)</label>
+            <input 
+                type="text" 
+                id="tags" 
+                ng-model="tagsInput" 
+                placeholder="e.g., javascript, python, web-dev" 
+                class="form-control">
+            <small>Enter tags separated by commas</small>
+        </div>
+        
+        <div class="form-group">
+            <label for="status">Status</label>
+            <select id="status" ng-model="postData.status" class="form-control">
+                <option value="published">Published</option>
+                <option value="draft">Draft</option>
+            </select>
+        </div>
+        
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary" ng-disabled="loading">
+                <span ng-if="!loading">Create Post</span>
+                <span ng-if="loading">Creating...</span>
+            </button>
+            <a href="/posts" class="btn">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/posts.controller.js') }}"></script>
+<script>
+angular.module('blogApp').controller('PostsController', ['$scope', '$window', 'ApiService', function($scope, $window, ApiService) {
+    $scope.postData = { status: 'published' };
+    $scope.tagsInput = '';
+    $scope.loading = false;
+    $scope.error = null;
+    
+    $scope.createPost = function(postData) {
+        var data = angular.copy(postData);
+        if ($scope.tagsInput) {
+            data.tags = $scope.tagsInput.split(',').map(function(tag) {
+                return tag.trim();
+            });
+        }
+        
+        $scope.loading = true;
+        $scope.error = null;
+        
+        ApiService.posts.create(data)
+            .then(function(response) {
+                $scope.loading = false;
+                $window.location.href = '/posts/' + response.data.post.id;
+            })
+            .catch(function(error) {
+                $scope.error = error.data.error || 'Failed to create post';
+                $scope.loading = false;
+            });
+    };
+}]);
+</script>
+{% endblock %}

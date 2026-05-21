@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Compose Message - Demo Blog{% endblock %}
+
+{% block content %}
+<div ng-app="blogApp" ng-controller="MessagesController">
+    <div class="page-header">
+        <h1>Compose Message</h1>
+    </div>
+    
+    <div ng-if="error" class="error-message">(( error ))</div>
+    
+    <form ng-submit="sendMessage(messageData)" class="message-form">
+        <div class="form-group">
+            <label for="recipient_id">Recipient User ID</label>
+            <input 
+                type="number" 
+                id="recipient_id" 
+                ng-model="messageData.recipient_id" 
+                required 
+                class="form-control">
+            <small>Enter the user ID of the recipient</small>
+        </div>
+        
+        <div class="form-group">
+            <label for="subject">Subject (optional)</label>
+            <input 
+                type="text" 
+                id="subject" 
+                ng-model="messageData.subject" 
+                class="form-control">
+        </div>
+        
+        <div class="form-group">
+            <label for="content">Message</label>
+            <textarea 
+                id="content" 
+                ng-model="messageData.content" 
+                rows="8" 
+                required 
+                class="form-control"></textarea>
+        </div>
+        
+        <div class="form-actions">
+            <button type="submit" class="btn btn-primary" ng-disabled="loading">
+                <span ng-if="!loading">Send Message</span>
+                <span ng-if="loading">Sending...</span>
+            </button>
+            <a href="/messages" class="btn">Cancel</a>
+        </div>
+    </form>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/services/api.service.js') }}"></script>
+<script src="{{ url_for('static', filename='js/controllers/messages.controller.js') }}"></script>
+{% endblock %}
