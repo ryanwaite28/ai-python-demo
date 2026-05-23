@@ -1,5 +1,13 @@
 version: '3.8'
 
+# Local development environment.
+# Starts the full stack: Postgres, Flask app, OpenSearch, OpenSearch Dashboards,
+# and Fluent Bit (ships app logs → local OpenSearch).
+#
+# OpenSearch API:       http://localhost:9200
+# OpenSearch Dashboards: http://localhost:5601
+# App:                  http://localhost:8080
+
 services:
   db:
     image: postgres:15-alpine
@@ -24,14 +32,17 @@ services:
     container_name: blog_app
     environment:
       FLASK_APP: app.py
-      FLASK_ENV: ${FLASK_ENV:-production}
-      SECRET_KEY: ${SECRET_KEY}
+      FLASK_ENV: ${FLASK_ENV:-development}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
       DATABASE_URL: postgresql://${POSTGRES_USER:-blog_user}:${POSTGRES_PASSWORD:-blog_password}@db:5432/${POSTGRES_DB:-blog_db}
       PORT: ${PORT:-8080}
       PYTHONUNBUFFERED: 1
+      LOG_FORMAT: json
+      SERVICE_NAME: flask-app
     volumes:
       - .:/app
       - /app/__pycache__
+      - app_logs:/app/logs
     ports:
       - "${PORT:-8080}:${PORT:-8080}"
     depends_on:
@@ -40,8 +51,57 @@ services:
     command: >
       sh -c "if [ ! -d 'migrations' ]; then flask db init; fi &&
              flask db migrate -m 'Initial migration' || true &&
-             flask db upgrade && 
+             flask db upgrade &&
              gunicorn -w 4 -b 0.0.0.0:${PORT:-8080} --reload 'app:create_app()'"
+
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: blog_opensearch
+    environment:
+      - discovery.type=single-node
+      - plugins.security.disabled=true
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: blog_opensearch_dashboards
+    environment:
+      - OPENSEARCH_HOSTS=http://opensearch:9200
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+
+  fluent-bit:
+    image: fluent/fluent-bit:3.2
+    container_name: blog_fluent_bit
+    volumes:
+      - app_logs:/logs:ro
+      - ./fluent-bit/fluent-bit.local.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - ./fluent-bit/common.conf:/fluent-bit/etc/common.conf:ro
+      - ./fluent-bit/parsers.conf:/fluent-bit/etc/parsers.conf:ro
+      - fluent_bit_state:/var/lib/fluent-bit
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      web:
+        condition: service_started
+    restart: unless-stopped
 
 volumes:
   postgres_data:
+  opensearch_data:
+  app_logs:
+  fluent_bit_state:
