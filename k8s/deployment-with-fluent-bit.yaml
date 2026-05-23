@@ -19,6 +19,8 @@ spec:
         prometheus.io/path: "/metrics"
         prometheus.io/port: "8080"
     spec:
+      imagePullSecrets:
+      - name: harbor-credentials
       initContainers:
       - name: db-migrate
         image: harbor.rmwhs.space/apps/ai-python-demo:latest
