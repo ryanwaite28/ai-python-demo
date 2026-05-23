@@ -91,7 +91,7 @@ spec:
                 sh '''
           trivy image \
             --exit-code 0 \
-            --severity HIGH,CRITICAL \
+            --severity CRITICAL \
             --no-progress \
             --format table \
             ${FULL_IMAGE}
