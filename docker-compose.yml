@@ -1,12 +1,12 @@
 version: '3.8'
 
-# Local development environment.
-# Starts the full stack: Postgres, Flask app, OpenSearch, OpenSearch Dashboards,
-# and Fluent Bit (ships app logs → local OpenSearch).
+# Local development environment — full observability stack.
 #
-# OpenSearch API:       http://localhost:9200
+# App:                   http://localhost:8080
+# Prometheus:            http://localhost:9090
+# Grafana:               http://localhost:3000  (admin / admin)
+# OpenSearch API:        http://localhost:9200
 # OpenSearch Dashboards: http://localhost:5601
-# App:                  http://localhost:8080
 
 services:
   db:
@@ -84,6 +84,39 @@ services:
       opensearch:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: blog_prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    ports:
+      - "9090:9090"
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: blog_grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
   fluent-bit:
     image: fluent/fluent-bit:3.2
     container_name: blog_fluent_bit
@@ -105,3 +138,5 @@ volumes:
   opensearch_data:
   app_logs:
   fluent_bit_state:
+  prometheus_data:
+  grafana_data:
