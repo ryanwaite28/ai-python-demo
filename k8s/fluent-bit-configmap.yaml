@@ -31,18 +31,19 @@ data:
     [OUTPUT]
         Name               opensearch
         Match              flask.*
-        Host               opensearch.monitoring.svc.cluster.local
-        Port               9200
-        HTTP_User          admin
-        HTTP_Passwd        Rmw@Srch2026#Kube
-        tls                Off
+        Host               ${OPENSEARCH_HOST}
+        Port               ${OPENSEARCH_PORT}
+        HTTP_User          ${OPENSEARCH_USER}
+        HTTP_Passwd        ${OPENSEARCH_PASSWORD}
+        tls                On
+        tls.verify         Off
         Logstash_Format    On
-        Logstash_Prefix    ai-python-demo-logs
+        Logstash_Prefix    ${OPENSEARCH_INDEX}
         Logstash_DateFormat %Y.%m.%d
         Time_Key           @timestamp
         Time_Key_Format    %Y-%m-%dT%H:%M:%S.%LZ
         Suppress_Type_Name On
-        Retry_Limit        3
+        Retry_Limit        5
         storage.total_limit_size 32M
 
   parsers.conf: |

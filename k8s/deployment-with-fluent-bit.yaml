@@ -66,8 +66,35 @@ spec:
           periodSeconds: 30
 
       # Fluent Bit sidecar — ships logs to OpenSearch
+      # - name: fluent-bit
+      #   image: fluent/fluent-bit:3.2
+      #   volumeMounts:
+      #   - name: app-logs
+      #     mountPath: /logs
+      #     readOnly: true
+      #   - name: fluent-bit-config
+      #     mountPath: /fluent-bit/etc
+      #   - name: fluent-bit-state
+      #     mountPath: /var/lib/fluent-bit
       - name: fluent-bit
-        image: fluent/fluent-bit:3.2
+        image: fluent/fluent-bit:latest
+        env:
+        - name: OPENSEARCH_HOST
+          value: opensearch-cluster-master.monitoring.svc.cluster.local
+        - name: OPENSEARCH_PORT
+          value: "9200"
+        - name: OPENSEARCH_INDEX
+          value: flask-logs
+        - name: OPENSEARCH_USER
+          valueFrom:
+            secretKeyRef:
+              name: opensearch-credentials
+              key: user
+        - name: OPENSEARCH_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: opensearch-credentials
+              key: password
         volumeMounts:
         - name: app-logs
           mountPath: /logs
