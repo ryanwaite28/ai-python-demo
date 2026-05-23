@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-python-demo-fluent-bit
+  namespace: ai-python-demo
+data:
+  fluent-bit.conf: |
+    [SERVICE]
+        Flush         5
+        Daemon        Off
+        Log_Level     info
+        Parsers_File  /fluent-bit/etc/parsers.conf
+        storage.path  /var/lib/fluent-bit/storage
+
+    [INPUT]
+        Name              tail
+        Path              /logs/app.*.log
+        Parser            flask_json
+        Tag               flask.ai-python-demo
+        Refresh_Interval  30
+        DB                /var/lib/fluent-bit/tail.db
+        DB.Sync           Normal
+        Skip_Long_Lines   On
+        Mem_Buf_Limit     5MB
+
+    [FILTER]
+        Name    modify
+        Match   flask.*
+        Rename  level log_level
+
+    [OUTPUT]
+        Name               opensearch
+        Match              flask.*
+        Host               opensearch.monitoring.svc.cluster.local
+        Port               9200
+        HTTP_User          admin
+        HTTP_Passwd        Rmw@Srch2026#Kube
+        tls                Off
+        Logstash_Format    On
+        Logstash_Prefix    ai-python-demo-logs
+        Logstash_DateFormat %Y.%m.%d
+        Time_Key           @timestamp
+        Time_Key_Format    %Y-%m-%dT%H:%M:%S.%LZ
+        Suppress_Type_Name On
+        Retry_Limit        3
+        storage.total_limit_size 32M
+
+  parsers.conf: |
+    [PARSER]
+        Name        flask_json
+        Format      json
+        Time_Key    timestamp
+        Time_Format %Y-%m-%dT%H:%M:%S.%LZ
+        Time_Keep   On

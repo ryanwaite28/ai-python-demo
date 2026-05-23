@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-python-demo
+  namespace: ai-python-demo
+  labels:
+    app: ai-python-demo
+spec:
+  selector:
+    app: ai-python-demo
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+  type: ClusterIP

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-sql
+  namespace: ai-python-demo
+data:
+  init.sql: |
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+    SET timezone = 'UTC';
+    CREATE SCHEMA IF NOT EXISTS blog;
+    GRANT ALL ON SCHEMA blog TO blog_user;
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA blog TO blog_user;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA blog TO blog_user;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA blog GRANT ALL ON TABLES TO blog_user;
+    ALTER DEFAULT PRIVILEGES IN SCHEMA blog GRANT ALL ON SEQUENCES TO blog_user;
+    ALTER DATABASE blog_db SET search_path TO blog, public;

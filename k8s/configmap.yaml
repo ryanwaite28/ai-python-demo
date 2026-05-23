@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-python-demo-config
+  namespace: ai-python-demo
+data:
+  FLASK_APP: app.py
+  FLASK_ENV: production
+  PORT: "8080"
+  PYTHONUNBUFFERED: "1"
+  LOG_FORMAT: json
+  LOG_DIR: /app/logs
+  SERVICE_NAME: ai-python-demo
