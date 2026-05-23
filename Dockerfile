@@ -14,4 +14,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE ${PORT}
 
-CMD gunicorn -w 4 -b 0.0.0.0:${PORT} app:app
+CMD gunicorn -w 4 -b 0.0.0.0:${PORT} "app:create_app()"
