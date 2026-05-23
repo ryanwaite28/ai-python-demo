@@ -87,7 +87,7 @@ spec:
             steps {
                 withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
                                           vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/data/ai-python-demo',
+                          vaultSecrets: [[path: 'kv/ai-python-demo',
                                          secretValues: [
                                              [envVar: 'DB_USER', vaultKey: 'db_user'],
                                              [envVar: 'DB_PASS', vaultKey: 'db_pass'],
@@ -170,7 +170,7 @@ spec:
             steps {
                 withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
                                           vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/data/ai-python-demo',
+                          vaultSecrets: [[path: 'kv/ai-python-demo',
                                          secretValues: [
                                              [envVar: 'DB_USER', vaultKey: 'db_user'],
                                              [envVar: 'DB_PASS', vaultKey: 'db_pass'],
@@ -244,7 +244,7 @@ spec:
             steps {
                 withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
                                           vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/data/ai-python-demo',
+                          vaultSecrets: [[path: 'kv/ai-python-demo',
                                          secretValues: [
                                              [envVar: 'DB_USER', vaultKey: 'db_user'],
                                              [envVar: 'DB_PASS', vaultKey: 'db_pass'],
