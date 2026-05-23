@@ -168,31 +168,16 @@ spec:
 
         stage('DB Setup') {
             steps {
-                withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
-                                          vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/ai-python-demo',
-                                         secretValues: [
-                                             [envVar: 'DB_USER', vaultKey: 'db_user'],
-                                             [envVar: 'DB_PASS', vaultKey: 'db_pass'],
-                                             [envVar: 'DB_NAME', vaultKey: 'db_name'],
-                                             [envVar: 'APP_KEY',  vaultKey: 'app_key']
-                                         ]]]) {
-                    script {
-                        // Ensure postgres is deployed and ready
-                        sh '''
-                            kubectl apply -f k8s/postgres-init-configmap.yaml -n ${K8S_NAMESPACE}
-                            kubectl apply -f k8s/postgres.yaml -n ${K8S_NAMESPACE}
-                            kubectl rollout status deployment/postgres -n ${K8S_NAMESPACE} --timeout=120s
-                        '''
+                script {
+                    sh '''
+                        kubectl apply -f k8s/postgres-init-configmap.yaml -n ${K8S_NAMESPACE}
+                        kubectl apply -f k8s/postgres.yaml -n ${K8S_NAMESPACE}
+                        kubectl rollout status deployment/postgres -n ${K8S_NAMESPACE} --timeout=120s
+                    '''
 
-                        def resetDb = params.RESET_DB ? 'true' : 'false'
-
-                        // Render the DB setup Job with Vault credentials
-                        def dbSetupSql = params.RESET_DB
-                            ? "DROP SCHEMA IF EXISTS blog CASCADE; CREATE SCHEMA blog;"
-                            : "CREATE DATABASE IF NOT EXISTS \\\"${env.DB_NAME}\\\"; CREATE SCHEMA IF NOT EXISTS blog;"
-
-                        writeFile file: '/tmp/db-setup-job.yaml', text: """
+                    // RESET_DB is a plain boolean param — safe to interpolate (not a secret).
+                    // Credentials come from the K8s secret applied in the Apply App Secret stage.
+                    writeFile file: 'db-setup-job.yaml', text: """
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -204,58 +189,67 @@ spec:
   template:
     spec:
       restartPolicy: Never
-      imagePullSecrets:
-      - name: harbor-credentials
       containers:
       - name: db-setup
         image: postgres:15-alpine
-        command:
-        - sh
-        - -c
+        command: [sh, -c]
+        args:
         - |
           set -e
-          echo "Waiting for postgres..."
-          until pg_isready -h postgres -U ${env.DB_USER}; do sleep 2; done
-          echo "Postgres ready."
-          ${params.RESET_DB
-              ? "psql -h postgres -U \\\"${env.DB_USER}\\\" -d postgres -c \\\"DROP SCHEMA IF EXISTS blog CASCADE;\\\"; psql -h postgres -U \\\"${env.DB_USER}\\\" -d \\\"${env.DB_NAME}\\\" -c \\\"CREATE SCHEMA IF NOT EXISTS blog;\\\""
-              : "psql -h postgres -U \\\"${env.DB_USER}\\\" -d postgres -c \\\"SELECT 1 FROM pg_database WHERE datname='${env.DB_NAME}'\\\" | grep -q 1 || psql -h postgres -U \\\"${env.DB_USER}\\\" -d postgres -c \\\"CREATE DATABASE \\\\\\\"${env.DB_NAME}\\\\\\\"\\\"; psql -h postgres -U \\\"${env.DB_USER}\\\" -d \\\"${env.DB_NAME}\\\" -c \\\"CREATE SCHEMA IF NOT EXISTS blog;\\\""
-          }
+          until pg_isready -h postgres -U \$POSTGRES_USER; do sleep 2; done
+          if [ "\$RESET_DB" = "true" ]; then
+            psql -h postgres -U \$POSTGRES_USER -d \$POSTGRES_DB \\
+              -c "DROP SCHEMA IF EXISTS blog CASCADE; CREATE SCHEMA blog;"
+          else
+            psql -h postgres -U \$POSTGRES_USER -d postgres \\
+              -tc "SELECT 1 FROM pg_database WHERE datname='\$POSTGRES_DB'" \\
+              | grep -q 1 || \\
+              psql -h postgres -U \$POSTGRES_USER -d postgres \\
+                -c "CREATE DATABASE \\"\$POSTGRES_DB\\""
+            psql -h postgres -U \$POSTGRES_USER -d \$POSTGRES_DB \\
+              -c "CREATE SCHEMA IF NOT EXISTS blog;"
+          fi
           echo "DB setup complete."
         env:
+        - name: RESET_DB
+          value: "${params.RESET_DB.toString()}"
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: ai-python-demo-secret
+              key: POSTGRES_USER
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: ai-python-demo-secret
+              key: POSTGRES_DB
         - name: PGPASSWORD
-          value: "${env.DB_PASS}"
+          valueFrom:
+            secretKeyRef:
+              name: ai-python-demo-secret
+              key: POSTGRES_PASSWORD
 """
-                        sh '''
-                            kubectl delete job -n ${K8S_NAMESPACE} \
-                              --selector=app=db-setup --ignore-not-found=true
-                            kubectl apply -f /tmp/db-setup-job.yaml
-                            kubectl wait job/db-setup-${BUILD_NUMBER} \
-                              -n ${K8S_NAMESPACE} \
-                              --for=condition=complete \
-                              --timeout=120s
-                        '''
-                    }
+                    sh '''
+                        kubectl delete job db-setup-${BUILD_NUMBER} \
+                          -n ${K8S_NAMESPACE} --ignore-not-found=true
+                        kubectl apply -f db-setup-job.yaml
+                        kubectl wait job/db-setup-${BUILD_NUMBER} \
+                          -n ${K8S_NAMESPACE} \
+                          --for=condition=complete \
+                          --timeout=120s
+                    '''
                 }
             }
         }
 
         stage('DB Migration') {
             steps {
-                withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
-                                          vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/ai-python-demo',
-                                         secretValues: [
-                                             [envVar: 'DB_USER', vaultKey: 'db_user'],
-                                             [envVar: 'DB_PASS', vaultKey: 'db_pass'],
-                                             [envVar: 'DB_NAME', vaultKey: 'db_name'],
-                                             [envVar: 'APP_KEY',  vaultKey: 'app_key']
-                                         ]]]) {
-                    script {
-                        // Apply PVC for migration logs (idempotent)
-                        sh 'kubectl apply -f k8s/migration-pvc.yaml -n ${K8S_NAMESPACE}'
+                script {
+                    sh 'kubectl apply -f k8s/migration-pvc.yaml -n ${K8S_NAMESPACE}'
 
-                        writeFile file: '/tmp/db-migrate-job.yaml', text: """
+                    // FULL_IMAGE and BUILD_NUMBER are not secrets — safe to interpolate.
+                    // DATABASE_URL and SECRET_KEY come from the K8s secret via secretKeyRef.
+                    writeFile file: 'db-migrate-job.yaml', text: """
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -273,18 +267,22 @@ spec:
       - name: db-migrate
         image: ${env.FULL_IMAGE}
         imagePullPolicy: Always
-        command:
-        - sh
-        - -c
+        command: [sh, -c]
+        args:
         - |
           set -o pipefail
           flask db upgrade 2>&1 | tee /migration-logs/migration-${env.BUILD_NUMBER}.log
-          echo "Migration exit code: \$?"
         env:
         - name: DATABASE_URL
-          value: "postgresql://${env.DB_USER}:${env.DB_PASS}@postgres:5432/${env.DB_NAME}"
+          valueFrom:
+            secretKeyRef:
+              name: ai-python-demo-secret
+              key: DATABASE_URL
         - name: SECRET_KEY
-          value: "${env.APP_KEY}"
+          valueFrom:
+            secretKeyRef:
+              name: ai-python-demo-secret
+              key: SECRET_KEY
         - name: FLASK_APP
           value: app.py
         - name: FLASK_ENV
@@ -297,16 +295,15 @@ spec:
         persistentVolumeClaim:
           claimName: migration-logs-pvc
 """
-                        sh '''
-                            kubectl delete job -n ${K8S_NAMESPACE} \
-                              --selector=app=db-migrate --ignore-not-found=true
-                            kubectl apply -f /tmp/db-migrate-job.yaml
-                            kubectl wait job/db-migrate-${BUILD_NUMBER} \
-                              -n ${K8S_NAMESPACE} \
-                              --for=condition=complete \
-                              --timeout=300s
-                        '''
-                    }
+                    sh '''
+                        kubectl delete job db-migrate-${BUILD_NUMBER} \
+                          -n ${K8S_NAMESPACE} --ignore-not-found=true
+                        kubectl apply -f db-migrate-job.yaml
+                        kubectl wait job/db-migrate-${BUILD_NUMBER} \
+                          -n ${K8S_NAMESPACE} \
+                          --for=condition=complete \
+                          --timeout=300s
+                    '''
                 }
             }
         }
