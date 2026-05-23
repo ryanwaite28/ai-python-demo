@@ -21,25 +21,6 @@ spec:
     spec:
       imagePullSecrets:
       - name: harbor-credentials
-      initContainers:
-      - name: db-migrate
-        image: harbor.rmwhs.space/apps/ai-python-demo:${IMAGE_TAG}
-        imagePullPolicy: Always
-        command: ["flask", "db", "upgrade"]
-        envFrom:
-        - configMapRef:
-            name: ai-python-demo-config
-        env:
-        - name: DATABASE_URL
-          valueFrom:
-            secretKeyRef:
-              name: ai-python-demo-secret
-              key: DATABASE_URL
-        - name: SECRET_KEY
-          valueFrom:
-            secretKeyRef:
-              name: ai-python-demo-secret
-              key: SECRET_KEY
       containers:
       - name: ai-python-demo
         image: harbor.rmwhs.space/apps/ai-python-demo:${IMAGE_TAG}

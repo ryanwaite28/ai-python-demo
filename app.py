@@ -26,6 +26,8 @@ def create_app(config_name=None):
     configure_logging(app)
 
     db.init_app(app)
+    # Migrate is kept for the `flask db` CLI — actual migrations run in the
+    # CI/CD pipeline (DB Migration stage), never at application runtime.
     migrate.init_app(app, db)
     login_manager.init_app(app)
 
