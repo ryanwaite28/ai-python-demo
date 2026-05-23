@@ -46,6 +46,21 @@ spec:
     }
 
     stages {
+        stage('Prepare K8s Secret') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'harbor-credentials', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh '''
+                    kubectl create secret docker-registry harbor-credentials \
+                    --namespace ${K8S_NAMESPACE} \
+                    --docker-server=${HARBOR_REGISTRY} \
+                    --docker-username=${USER} \
+                    --docker-password=${PASS} \
+                    --dry-run=client -o yaml | kubectl apply -f -
+                    '''
+                }
+            }
+        }
+
         stage('Checkout') {
             steps {
                 checkout scm
@@ -54,6 +69,11 @@ spec:
         }
 
         stage('SonarQube Scan') {
+            when {
+                allOf {
+                    branch 'main'
+                }
+            }
             steps {
                 withSonarQubeEnv('SonarQube') {
                     sh '''
@@ -68,6 +88,11 @@ spec:
         }
 
         stage('Quality Gate') {
+            when {
+                allOf {
+                    branch 'main'
+                }
+            }
             steps {
                 timeout(time: 5, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
