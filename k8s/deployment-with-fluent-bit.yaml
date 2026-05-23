@@ -23,7 +23,8 @@ spec:
       - name: harbor-credentials
       initContainers:
       - name: db-migrate
-        image: harbor.rmwhs.space/apps/ai-python-demo:latest
+        image: harbor.rmwhs.space/apps/ai-python-demo:${IMAGE_TAG}
+        imagePullPolicy: Always
         command: ["flask", "db", "upgrade"]
         envFrom:
         - configMapRef:
@@ -41,7 +42,8 @@ spec:
               key: SECRET_KEY
       containers:
       - name: ai-python-demo
-        image: harbor.rmwhs.space/apps/ai-python-demo:latest
+        image: harbor.rmwhs.space/apps/ai-python-demo:${IMAGE_TAG}
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
           name: http
@@ -93,13 +95,6 @@ spec:
           mountPath: /fluent-bit/etc
         - name: fluent-bit-state
           mountPath: /var/lib/fluent-bit
-        resources:
-          requests:
-            cpu: 50m
-            memory: 64Mi
-          limits:
-            cpu: 100m
-            memory: 128Mi
 
       volumes:
       - name: app-logs
