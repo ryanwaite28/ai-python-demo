@@ -12,7 +12,7 @@ spec:
   - name: harbor-credentials
   containers:
   - name: jenkins-agent
-    image: harbor.rmwhs.space/devops/jenkins-agent-python:latest
+    image: harbor.rmwhs.space/devops/jenkins-agent-base:latest
     imagePullPolicy: Always
     command:
     - sleep
@@ -37,6 +37,7 @@ spec:
     }
 
     parameters {
+        booleanParam(name: 'SKIP_TESTS',    defaultValue: false, description: 'Skip in-Dockerfile unit tests (debug only — never deploy)')
         booleanParam(name: 'SKIP_TRIVY',    defaultValue: false, description: 'Skip Trivy vulnerability scan')
         booleanParam(name: 'RUN_MIGRATION', defaultValue: true,  description: 'Run database migrations on deploy')
         booleanParam(name: 'RESET_DB',      defaultValue: false, description: 'Drop and recreate the database schema. WARNING: destroys all data.')
@@ -56,28 +57,37 @@ spec:
 
     stages {
 
-        stage('Pre-flight Checks') {
+        stage('Checkout') {
             steps {
                 checkout scm
+                sh 'git log --oneline -5'
+            }
+        }
+
+        stage('Pre-flight Checks') {
+            steps {
                 sh '''
                     test -f k8s/db-secret.yaml || \
                       (echo "ERROR: k8s/db-secret.yaml template is missing from the repo" && exit 1)
                     echo "k8s/db-secret.yaml present — OK"
-                    git log --oneline -5
+                    kubectl version --client
+                    docker info
+                    trivy --version
+                    sonar-scanner --version
                 '''
             }
         }
 
         stage('Prepare K8s Namespace & Registry Secret') {
             steps {
-                sh 'kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -'
-                withCredentials([usernamePassword(credentialsId: 'harbor-credentials', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                withCredentials([usernamePassword(credentialsId: 'harbor-credentials', usernameVariable: 'HARBOR_USER', passwordVariable: 'HARBOR_PASS')]) {
                     sh '''
+                        kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
                         kubectl create secret docker-registry harbor-credentials \
                           --namespace ${K8S_NAMESPACE} \
                           --docker-server=${HARBOR_REGISTRY} \
-                          --docker-username=${USER} \
-                          --docker-password=${PASS} \
+                          --docker-username=${HARBOR_USER} \
+                          --docker-password=${HARBOR_PASS} \
                           --dry-run=client -o yaml | kubectl apply -f -
                     '''
                 }
@@ -95,16 +105,21 @@ spec:
                                              [envVar: 'DB_NAME', vaultKey: 'db_name'],
                                              [envVar: 'APP_KEY',  vaultKey: 'app_key']
                                          ]]]) {
-                    sh """
-                        envsubst '\$DB_USER \$DB_PASS \$DB_NAME \$APP_KEY' \
-                          < k8s/db-secret.yaml | kubectl apply -f -
-                    """
+                    sh '''
+                        kubectl create secret generic ai-python-demo-secret \
+                          --from-literal=POSTGRES_DB=${DB_NAME} \
+                          --from-literal=POSTGRES_USER=${DB_USER} \
+                          --from-literal=POSTGRES_PASSWORD=${DB_PASS} \
+                          --from-literal=SECRET_KEY=${APP_KEY} \
+                          --from-literal=DATABASE_URL=postgresql://${DB_USER}:${DB_PASS}@postgres:5432/${DB_NAME} \
+                          --namespace=${K8S_NAMESPACE} \
+                          --dry-run=client -o yaml | kubectl apply -f -
+                    '''
                 }
             }
         }
 
         stage('SonarQube Scan') {
-            when { branch 'main' }
             steps {
                 withSonarQubeEnv('SonarQube') {
                     sh '''
@@ -119,7 +134,6 @@ spec:
         }
 
         stage('Quality Gate') {
-            when { branch 'main' }
             steps {
                 timeout(time: 5, unit: 'MINUTES') {
                     waitForQualityGate abortPipeline: true
@@ -127,14 +141,23 @@ spec:
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Build & Login') {
             steps {
-                sh '''
-                    docker build \
-                      -t ${FULL_IMAGE} \
-                      -t ${LATEST_IMAGE} \
-                      .
-                '''
+                withCredentials([usernamePassword(
+                    credentialsId: 'harbor-credentials',
+                    usernameVariable: 'HARBOR_USER',
+                    passwordVariable: 'HARBOR_PASS'
+                )]) {
+                    sh '''
+                        echo "${HARBOR_PASS}" | docker login ${HARBOR_REGISTRY} \
+                          -u ${HARBOR_USER} --password-stdin
+                        docker build \
+                          --build-arg SKIP_TESTS=${SKIP_TESTS} \
+                          -t ${FULL_IMAGE} \
+                          -t ${LATEST_IMAGE} \
+                          .
+                    '''
+                }
             }
         }
 
@@ -155,17 +178,10 @@ spec:
 
         stage('Push to Harbor') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'harbor-credentials',
-                    usernameVariable: 'HARBOR_USER',
-                    passwordVariable: 'HARBOR_PASS'
-                )]) {
-                    sh '''
-                        echo "${HARBOR_PASS}" | docker login ${HARBOR_REGISTRY} -u ${HARBOR_USER} --password-stdin
-                        docker push ${FULL_IMAGE}
-                        docker push ${LATEST_IMAGE}
-                    '''
-                }
+                sh '''
+                    docker push ${FULL_IMAGE}
+                    docker push ${LATEST_IMAGE}
+                '''
             }
         }
 
@@ -215,7 +231,7 @@ spec:
           echo "DB setup complete."
         env:
         - name: RESET_DB
-          value: "${params.RESET_DB.toString()}"
+          value: "${params.RESET_DB}"
         - name: POSTGRES_USER
           valueFrom:
             secretKeyRef:
