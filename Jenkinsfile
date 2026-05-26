@@ -12,7 +12,7 @@ spec:
   - name: harbor-credentials
   containers:
   - name: jenkins-agent
-    image: harbor.rmwhs.space/devops/jenkins-agent:latest
+    image: harbor.rmwhs.space/devops/jenkins-agent-python:latest
     imagePullPolicy: Always
     command:
     - sleep
@@ -26,6 +26,8 @@ spec:
     image: docker:24-dind
     securityContext:
       privileged: true
+    args:
+    - "--mtu=1400"
     env:
     - name: DOCKER_TLS_CERTDIR
       value: ""
@@ -35,11 +37,9 @@ spec:
     }
 
     parameters {
-        booleanParam(
-            name: 'RESET_DB',
-            defaultValue: false,
-            description: 'Drop and recreate the database schema. WARNING: destroys all data.'
-        )
+        booleanParam(name: 'SKIP_TRIVY',    defaultValue: false, description: 'Skip Trivy vulnerability scan')
+        booleanParam(name: 'RUN_MIGRATION', defaultValue: true,  description: 'Run database migrations on deploy')
+        booleanParam(name: 'RESET_DB',      defaultValue: false, description: 'Drop and recreate the database schema. WARNING: destroys all data.')
     }
 
     environment {
@@ -51,6 +51,7 @@ spec:
         LATEST_IMAGE     = "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${IMAGE_NAME}:latest"
         SONAR_PROJECT    = 'ai-python-demo'
         K8S_NAMESPACE    = 'ai-python-demo'
+        TRIVY_SERVER     = 'http://trivy-server.security.svc.cluster.local:4954'
     }
 
     stages {
@@ -87,7 +88,7 @@ spec:
             steps {
                 withVault(configuration: [vaultUrl: 'https://vault.rmwhs.space',
                                           vaultCredentialId: 'vault-auth-token'],
-                          vaultSecrets: [[path: 'kv/ai-python-demo',
+                          vaultSecrets: [[path: "kv/${env.IMAGE_NAME}",
                                          secretValues: [
                                              [envVar: 'DB_USER', vaultKey: 'db_user'],
                                              [envVar: 'DB_PASS', vaultKey: 'db_pass'],
@@ -138,11 +139,13 @@ spec:
         }
 
         stage('Trivy Image Scan') {
+            when { expression { !params.SKIP_TRIVY } }
             steps {
                 sh '''
                     trivy image \
+                      --server ${TRIVY_SERVER} \
                       --exit-code 0 \
-                      --severity CRITICAL \
+                      --severity HIGH,CRITICAL \
                       --no-progress \
                       --format table \
                       ${FULL_IMAGE}
@@ -243,6 +246,7 @@ spec:
         }
 
         stage('DB Migration') {
+            when { expression { params.RUN_MIGRATION } }
             steps {
                 script {
                     sh 'kubectl apply -f k8s/migration-pvc.yaml -n ${K8S_NAMESPACE}'

@@ -6,7 +6,7 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: local-path
+  storageClassName: nfs-client
   resources:
     requests:
       storage: 10Gi
@@ -26,6 +26,13 @@ spec:
       labels:
         app: postgres
     spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
       containers:
       - name: postgres
         image: postgres:15-alpine
