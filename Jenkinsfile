@@ -71,7 +71,7 @@ spec:
                       (echo "ERROR: k8s/db-secret.yaml template is missing from the repo" && exit 1)
                     echo "k8s/db-secret.yaml present — OK"
                     kubectl version --client
-                    docker info
+                    docker --version
                     trivy --version
                     sonar-scanner --version
                 '''
