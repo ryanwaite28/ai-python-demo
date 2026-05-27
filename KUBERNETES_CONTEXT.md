@@ -109,6 +109,21 @@ kv/ai-python-demo             ← ai python demo secrets
 
 > The Vault path **must match** the `IMAGE_NAME` / `K8S_NAMESPACE` value in the Jenkinsfile. Using `kv/${IMAGE_NAME}` in the pipeline ensures they always stay in sync.
 
+### Common App Deploy Secrets
+
+A shared Vault path `kv/common-app-deploy-secrets` holds credentials required by **all** apps for standard deployment tasks. These are not app-specific — they cover the shared infrastructure every app depends on.
+
+| Key | Purpose |
+|-----|---------|
+| `harbor_username` | Harbor registry username (image push/pull, imagePullSecret) |
+| `harbor_password` | Harbor registry password |
+| `opensearch_username` | OpenSearch username (Fluent Bit log forwarding) |
+| `opensearch_password` | OpenSearch password |
+| `mailpit_user` | Mailpit SMTP username (if auth is enabled on the Mailpit deployment) |
+| `mailpit_password` | Mailpit SMTP password |
+
+Every app Jenkinsfile must pull from `kv/common-app-deploy-secrets` alongside its own `kv/${IMAGE_NAME}` path. Combine both in a single `withVault` block. The common path is the source of truth for Harbor, OpenSearch, and Mailpit credentials — do not duplicate these values into per-app Vault paths.
+
 ### Step 1 — Create Vault Secrets Before Running the Pipeline
 
 **This must be done before the first pipeline run.** The pipeline will fail if the Vault path does not exist.
@@ -164,7 +179,7 @@ withVault(
 }
 ```
 
-Multiple Vault paths can be combined in one `withVault` block:
+Multiple Vault paths can be combined in one `withVault` block. The standard pattern for app pipelines is to pull `kv/common-app-deploy-secrets` alongside the app's own path:
 
 ```groovy
 withVault(
@@ -173,12 +188,15 @@ withVault(
     vaultCredentialId: 'vault-auth-token'
   ],
   vaultSecrets: [
-    [path: 'kv/myapp', secretValues: [
-      [envVar: 'SECRET_KEY', vaultKey: 'secret_key'],
-      [envVar: 'DB_PASSWORD', vaultKey: 'db_password']
+    [path: 'kv/common-app-deploy-secrets', secretValues: [
+      [envVar: 'HARBOR_USER',     vaultKey: 'harbor_username'],
+      [envVar: 'HARBOR_PASS',     vaultKey: 'harbor_password'],
+      [envVar: 'OPENSEARCH_USER', vaultKey: 'opensearch_username'],
+      [envVar: 'OPENSEARCH_PASS', vaultKey: 'opensearch_password']
     ]],
-    [path: 'kv/shared', secretValues: [
-      [envVar: 'SMTP_PASSWORD', vaultKey: 'smtp_password']
+    [path: 'kv/myapp', secretValues: [
+      [envVar: 'SECRET_KEY',  vaultKey: 'secret_key'],
+      [envVar: 'DB_PASSWORD', vaultKey: 'db_password']
     ]]
   ]
 ) {
@@ -202,20 +220,77 @@ App container environment
 
 It is acceptable (and recommended) to have a dedicated pipeline stage that reads from Vault and writes to a Kubernetes secret. The secret manifest committed to the repo is a **template only** — no values.
 
+### Runtime Vault Access
+
+Apps that need to read secrets from Vault at runtime (not just at deploy time) can have the Vault token injected into their Kubernetes namespace secret by the pipeline. This lets the application call the Vault API directly without any external credential distribution.
+
+**When to use:** apps that rotate credentials at runtime, fetch per-request secrets, or need dynamic secret generation. For simple static secrets (DB password, API keys), the standard pipeline injection pattern is sufficient and preferred.
+
+**How to wire it up:**
+
+1. In the `Apply App Secret` stage, pull `vault-auth-token` via `withCredentials` and include it in the `kubectl create secret` call:
+
+```groovy
+stage('Apply App Secret') {
+  steps {
+    withCredentials([string(credentialsId: 'vault-auth-token', variable: 'VAULT_TOKEN')]) {
+      withVault(/* ... existing withVault config ... */) {
+        sh '''
+          kubectl create secret generic ${IMAGE_NAME}-secret \
+            --from-literal=VAULT_TOKEN=${VAULT_TOKEN} \
+            --from-literal=SECRET_KEY=${SECRET_KEY} \
+            --from-literal=DB_PASSWORD=${DB_PASSWORD} \
+            --namespace=${K8S_NAMESPACE} \
+            --dry-run=client -o yaml | kubectl apply -f -
+        '''
+      }
+    }
+  }
+}
+```
+
+2. In the app's Deployment, expose `VAULT_TOKEN` and `VAULT_ADDR` from the secret:
+
+```yaml
+env:
+- name: VAULT_ADDR
+  value: "http://vault.devops.svc.cluster.local:8200"
+- name: VAULT_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: myapp-secret
+      key: VAULT_TOKEN
+```
+
+3. The app can now call the Vault HTTP API or use a Vault SDK directly:
+
+```python
+# Python example
+import os, requests
+vault_addr  = os.environ['VAULT_ADDR']
+vault_token = os.environ['VAULT_TOKEN']
+secret = requests.get(
+    f"{vault_addr}/v1/kv/data/myapp",
+    headers={"X-Vault-Token": vault_token}
+).json()['data']['data']
+```
+
+> The Vault token in `vault-auth-token` has broad platform-level access. Treat it as a privileged credential in the app's Kubernetes secret — restrict secret access with RBAC and never log or expose the token value.
+
 ### Jenkins Credentials (Platform Use Only)
 
-Jenkins credentials are reserved for platform-level access. App secrets go in Vault.
+Jenkins credentials are reserved for platform-level access. App secrets go in Vault. Harbor and OpenSearch credentials for app pipelines come from `kv/common-app-deploy-secrets` — do not use `harbor-credentials` in app Jenkinsfiles.
 
 | Credential ID | Type | Used For |
 |--------------|------|---------|
 | `vault-auth-token` | Secret Text | Authenticating `withVault` calls |
-| `harbor-credentials` | Username/Password | Docker login to Harbor + image pulls |
+| `harbor-credentials` | Username/Password | Pre-configured imagePullSecret in `jenkins-agents` namespace (platform use only) |
 | `gitlab-root-token` | Username/Password | GitLab API access and repo cloning |
 | `sonarqube-token` | Secret Text | SonarQube analysis authentication |
 
 #### Using `harbor-credentials` in the Pipeline
 
-`harbor-credentials` is pre-configured as a Kubernetes imagePullSecret in `jenkins-agents`. Propagate it to new namespaces via `withCredentials` — never hardcode the password:
+`harbor-credentials` is pre-configured as a Kubernetes imagePullSecret in `jenkins-agents`. App pipelines create their own namespace imagePullSecret using Harbor credentials pulled from Vault (`kv/common-app-deploy-secrets`) — not via `withCredentials`. The example below is for platform-level tooling only:
 
 ```groovy
 stage('Prepare K8s Namespace & Registry Secret') {
@@ -450,27 +525,33 @@ The agent runs the pipeline; the Dockerfile runs the build and tests; the manife
 
 Every app's Dockerfile **must** satisfy two requirements:
 
-1. **Unit tests run inside the build** — typically in a multi-stage build's "build" stage, before producing the final runtime image. A failed test fails `docker build`, which fails the pipeline at the `Build & Login` stage — before scan, push, or deploy. This is the test gate.
-2. **A `SKIP_TESTS` build arg short-circuits the tests** — for fast debug iteration only. The Jenkinsfile exposes a matching `SKIP_TESTS` boolean parameter and forwards it via `--build-arg`.
+1. **Tests run inside the build** — in a multi-stage build's "build" stage, before producing the final runtime image. A failed test fails `docker build`, which fails the pipeline before scan, push, or deploy. This is the test gate.
+2. **Each test scope has its own `SKIP_*` build arg** — one arg per test scope, not a single blunt `SKIP_TESTS`. The Jenkinsfile exposes matching boolean parameters and forwards them via `--build-arg`.
 
-#### Multi-stage Dockerfile example
+#### Multi-stage Dockerfile example (Python)
 
 ```dockerfile
 # syntax=docker/dockerfile:1
 FROM python:3.13-slim AS build
 
-ARG SKIP_TESTS=false
+ARG SKIP_UNIT_TESTS=false
+ARG SKIP_INTEGRATION_TESTS=false
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-# Tests run as part of the build. SKIP_TESTS=true skips them (debug only).
-RUN if [ "$SKIP_TESTS" = "true" ]; then \
-      echo "WARNING: tests skipped (SKIP_TESTS=true)"; \
+RUN if [ "$SKIP_UNIT_TESTS" = "true" ]; then \
+      echo "WARNING: unit tests skipped"; \
     else \
-      pytest tests/ -q; \
+      pytest tests/unit/ -q; \
+    fi
+
+RUN if [ "$SKIP_INTEGRATION_TESTS" = "true" ]; then \
+      echo "WARNING: integration tests skipped"; \
+    else \
+      pytest tests/integration/ -q; \
     fi
 
 FROM python:3.13-slim AS runtime
@@ -479,19 +560,23 @@ COPY --from=build /app /app
 CMD ["python", "main.py"]
 ```
 
-The same pattern works for any language:
+The same pattern for other languages:
 
 ```dockerfile
 # Node example
-ARG SKIP_TESTS=false
-RUN if [ "$SKIP_TESTS" = "true" ]; then echo "tests skipped"; else npm test; fi
+ARG SKIP_UNIT_TESTS=false
+ARG SKIP_INTEGRATION_TESTS=false
+RUN if [ "$SKIP_UNIT_TESTS" != "true" ]; then npm run test:unit; fi
+RUN if [ "$SKIP_INTEGRATION_TESTS" != "true" ]; then npm run test:integration; fi
 
 # Go example
-ARG SKIP_TESTS=false
-RUN if [ "$SKIP_TESTS" = "true" ]; then echo "tests skipped"; else go test ./...; fi
+ARG SKIP_UNIT_TESTS=false
+ARG SKIP_INTEGRATION_TESTS=false
+RUN if [ "$SKIP_UNIT_TESTS" != "true" ]; then go test ./internal/...; fi
+RUN if [ "$SKIP_INTEGRATION_TESTS" != "true" ]; then go test ./integration/...; fi
 ```
 
-> `SKIP_TESTS=true` is for **debug iterations only.** Never merge or deploy an image built with tests skipped. The pipeline parameter exists to unblock pipeline debugging (e.g. when chasing a Harbor or k8s issue), not as a routine flag.
+> All `SKIP_*` args default to `false` — every test scope runs by default. Skipping is for **debug iterations only.** Never merge or deploy an image built with any test scope skipped. Add only the args that correspond to real test scopes in the app — do not add `SKIP_INTEGRATION_TESTS` to an app that has no integration tests.
 
 ### DinD (Docker-in-Docker) Requirements
 
@@ -500,6 +585,15 @@ All pipelines that build Docker images require a DinD sidecar. Key requirements:
 - **`--mtu=1400`** is mandatory in DinD daemon args. k3s overlay network MTU is ~1450; DinD defaults to 1500. The mismatch causes `curl: (35) Connection reset by peer` on large downloads (Helm, OS packages) inside the DinD daemon during image builds.
 - **`DOCKER_TLS_CERTDIR: ""`** disables TLS on the Docker socket — use unencrypted TCP on port 2375 between the builder and DinD containers.
 - The builder container sets `DOCKER_HOST: tcp://localhost:2375`.
+- **Daemon readiness wait: always use `docker --version`, never `docker info`.** `docker info` connects to the daemon and queries running state; it has been observed to hang or fail transiently before the daemon is fully initialized. `docker --version` is a local binary check that exits immediately and reliably signals the CLI is present and the socket is reachable.
+
+```groovy
+sh '''
+    echo "Waiting for Docker daemon..."
+    timeout 30 sh -c 'until docker --version > /dev/null 2>&1; do sleep 1; done'
+    echo "Docker daemon ready."
+'''
+```
 
 ```yaml
 - name: dind
@@ -517,14 +611,51 @@ All pipelines that build Docker images require a DinD sidecar. Key requirements:
 
 Use a `parameters` block in every Jenkinsfile to give operators control over what runs in each pipeline execution. Sensible defaults mean routine runs need no changes; operators can activate optional stages when needed.
 
-**Universal parameters** (all pipelines):
+#### Critical stages — never skippable
+
+Two stages are always mandatory and must not be gated by any parameter:
+
+| Stage | Why |
+|-------|-----|
+| **Build Docker image** | The image is the artifact. Skipping it means nothing was built. |
+| **Deploy to Kubernetes** | The whole purpose of the pipeline. Skipping defeats the CI/CD contract. |
+
+Every other stage is optional and should be controlled by a dedicated boolean parameter.
+
+#### Universal parameters (all app pipelines)
 
 | Parameter | Type | Default | Purpose |
 |-----------|------|---------|---------|
-| `SKIP_TESTS` | Boolean | `false` | Skip the in-Dockerfile unit-test step via `--build-arg SKIP_TESTS=true`. **Debug iteration only — never merge or deploy a build made with tests skipped.** |
-| `SKIP_TRIVY` | Boolean | `false` | Skip Trivy vulnerability scan (useful when iterating quickly or debugging other stages) |
+| `SKIP_SONAR` | Boolean | `false` | Skip SonarQube static analysis scan |
+| `SKIP_QUALITY_GATE` | Boolean | `false` | Skip waiting for SonarQube quality gate result |
+| `SKIP_TRIVY` | Boolean | `false` | Skip Trivy vulnerability scan |
 
-**App-type-specific parameters** (add as applicable based on the app's architecture):
+#### Fine-grained test parameters
+
+Rather than a single `SKIP_TESTS` flag, **each test scope gets its own parameter.** This lets operators skip a slow integration suite without disabling fast unit tests, or re-run only a specific scope when debugging.
+
+| Parameter | Type | Default | Scope |
+|-----------|------|---------|-------|
+| `SKIP_UNIT_TESTS` | Boolean | `false` | In-Dockerfile unit tests — fastest feedback loop |
+| `SKIP_INTEGRATION_TESTS` | Boolean | `false` | In-Dockerfile integration tests (DB, cache, external service mocks) |
+| `SKIP_E2E_TESTS` | Boolean | `false` | End-to-end tests (if the app has them — omit if not applicable) |
+
+Add only the test parameters that correspond to actual test scopes in the app's Dockerfile. Do not add `SKIP_INTEGRATION_TESTS` to an app that has no integration tests.
+
+Each parameter must be forwarded to `docker build` as a `--build-arg`:
+
+```groovy
+sh """
+  docker build \\
+    --build-arg SKIP_UNIT_TESTS=${params.SKIP_UNIT_TESTS} \\
+    --build-arg SKIP_INTEGRATION_TESTS=${params.SKIP_INTEGRATION_TESTS} \\
+    -t ${FULL_IMAGE} -t ${LATEST_IMAGE} .
+"""
+```
+
+> All test parameters default to `false` — tests run by default. Skipping any test scope is for **debug iteration only.** Never merge or deploy a build where tests were skipped.
+
+#### App-type-specific parameters (add as applicable)
 
 | Parameter | Type | Default | Use When |
 |-----------|------|---------|----------|
@@ -532,13 +663,14 @@ Use a `parameters` block in every Jenkinsfile to give operators control over wha
 | `RESET_DB` | Boolean | `false` | Wipe and recreate the database (**destructive** — data loss, use intentionally) |
 | `SEED_DB` | Boolean | `false` | Run database seed/fixture data after migration |
 | `CLEAR_CACHE` | Boolean | `false` | App uses Redis — flush the cache on deploy |
-| `DEPLOY_ALL` | Boolean | `false` | Force redeploy all pods even if the image tag did not change |
+| `FORCE_REDEPLOY` | Boolean | `false` | Force pod rollout even if the image tag did not change |
 
 **Design rules:**
 - Destructive operations (`RESET_DB`, `CLEAR_CACHE`) must default to `false`
 - Safe-to-repeat operations (`RUN_MIGRATION`) can default to `true`
 - Each parameter gates exactly one stage with `when { expression { params.PARAM_NAME } }`
 - Add only the parameters that apply to the app's architecture — don't add `RUN_MIGRATION` to a stateless app
+- The critical stages (build + deploy) are never gated — they always run
 
 ### Trivy Server (Scan API)
 
@@ -617,10 +749,17 @@ All app pipelines use the single `jenkins-agent-base` image. The app's Dockerfil
 ```groovy
 pipeline {
   parameters {
-    booleanParam(name: 'SKIP_TESTS',    defaultValue: false, description: 'Skip in-Dockerfile unit tests (debug only — never deploy)')
-    booleanParam(name: 'SKIP_TRIVY',    defaultValue: false, description: 'Skip Trivy vulnerability scan')
-    booleanParam(name: 'RUN_MIGRATION', defaultValue: true,  description: 'Run database migrations on deploy')
-    // Add app-specific params: RESET_DB, CLEAR_CACHE, SEED_DB, DEPLOY_ALL, etc.
+    // ── Static analysis & security (skippable, default: run) ──
+    booleanParam(name: 'SKIP_SONAR',              defaultValue: false, description: 'Skip SonarQube static analysis scan')
+    booleanParam(name: 'SKIP_QUALITY_GATE',        defaultValue: false, description: 'Skip SonarQube quality gate wait')
+    booleanParam(name: 'SKIP_TRIVY',               defaultValue: false, description: 'Skip Trivy vulnerability scan')
+    // ── Per-scope test parameters (skippable, default: run) ──
+    booleanParam(name: 'SKIP_UNIT_TESTS',          defaultValue: false, description: 'Skip unit tests in Docker build (debug only — never deploy)')
+    booleanParam(name: 'SKIP_INTEGRATION_TESTS',   defaultValue: false, description: 'Skip integration tests in Docker build (debug only — never deploy)')
+    // Add SKIP_E2E_TESTS if the app has end-to-end tests.
+    // ── Deployment options (app-specific — add what applies) ──
+    booleanParam(name: 'RUN_MIGRATION',            defaultValue: true,  description: 'Run database migrations on deploy')
+    // Add app-specific params: RESET_DB, CLEAR_CACHE, SEED_DB, FORCE_REDEPLOY, etc.
   }
 
   agent {
@@ -682,19 +821,28 @@ spec:
     stage('Pre-flight Checks') {
       steps {
         sh 'kubectl version --client'
-        sh 'docker info'
+        sh 'docker --version'
         sh 'trivy --version'
         sh 'sonar-scanner --version'
       }
     }
 
     stage('Prepare K8s Namespace & Registry Secret') {
+      // Harbor credentials come from Vault kv/common-app-deploy-secrets, not Jenkins credentials.
       steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'harbor-credentials',
-          usernameVariable: 'HARBOR_USER',
-          passwordVariable: 'HARBOR_PASS'
-        )]) {
+        withVault(
+          configuration: [
+            vaultUrl: 'https://vault.rmwhs.space',
+            vaultCredentialId: 'vault-auth-token'
+          ],
+          vaultSecrets: [[
+            path: 'kv/common-app-deploy-secrets',
+            secretValues: [
+              [envVar: 'HARBOR_USER', vaultKey: 'harbor_username'],
+              [envVar: 'HARBOR_PASS', vaultKey: 'harbor_password']
+            ]
+          ]]
+        ) {
           sh '''
             kubectl create namespace ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
             kubectl create secret docker-registry harbor-credentials \
@@ -709,28 +857,38 @@ spec:
     }
 
     stage('Apply App Secret') {
-      // Pull app secrets from Vault and inject into the cluster as a Kubernetes secret.
-      // Vault path must exist before running the pipeline: kv/<app-name>
-      // Add one secretValues entry per key needed by the app.
+      // Pull common secrets (Harbor, OpenSearch) and app-specific secrets from Vault.
+      // Vault path kv/<app-name> must exist before the first pipeline run.
+      // Add one secretValues entry per app-specific key needed.
       steps {
         withVault(
           configuration: [
             vaultUrl: 'https://vault.rmwhs.space',
             vaultCredentialId: 'vault-auth-token'
           ],
-          vaultSecrets: [[
-            path: "kv/${IMAGE_NAME}",
-            secretValues: [
+          vaultSecrets: [
+            [path: 'kv/common-app-deploy-secrets', secretValues: [
+              [envVar: 'HARBOR_USER',     vaultKey: 'harbor_username'],
+              [envVar: 'HARBOR_PASS',     vaultKey: 'harbor_password'],
+              [envVar: 'OPENSEARCH_USER', vaultKey: 'opensearch_username'],
+              [envVar: 'OPENSEARCH_PASS', vaultKey: 'opensearch_password']
+            ]],
+            [path: "kv/${IMAGE_NAME}", secretValues: [
               [envVar: 'SECRET_KEY',  vaultKey: 'secret_key'],
               [envVar: 'DB_PASSWORD', vaultKey: 'db_password']
-              // add more keys as needed
-            ]
-          ]]
+              // add more app-specific keys as needed
+            ]]
+          ]
         ) {
           sh '''
             kubectl create secret generic ${IMAGE_NAME}-secret \
               --from-literal=SECRET_KEY=${SECRET_KEY} \
               --from-literal=DB_PASSWORD=${DB_PASSWORD} \
+              --namespace=${K8S_NAMESPACE} \
+              --dry-run=client -o yaml | kubectl apply -f -
+            kubectl create secret generic opensearch-credentials \
+              --from-literal=OPENSEARCH_USER=${OPENSEARCH_USER} \
+              --from-literal=OPENSEARCH_PASS=${OPENSEARCH_PASS} \
               --namespace=${K8S_NAMESPACE} \
               --dry-run=client -o yaml | kubectl apply -f -
           '''
@@ -739,6 +897,7 @@ spec:
     }
 
     stage('SonarQube Scan') {
+      when { expression { !params.SKIP_SONAR } }
       steps {
         withSonarQubeEnv('SonarQube') {
           sh '''
@@ -753,6 +912,7 @@ spec:
     }
 
     stage('Quality Gate') {
+      when { expression { !params.SKIP_SONAR && !params.SKIP_QUALITY_GATE } }
       steps {
         timeout(time: 5, unit: 'MINUTES') {
           waitForQualityGate abortPipeline: true
@@ -761,23 +921,33 @@ spec:
     }
 
     stage('Build & Login') {
-      // Log in to Harbor before building so credentials persist for both build and push.
-      // SKIP_TESTS is forwarded to the Dockerfile — tests run inside the build by default.
+      // Harbor credentials come from Vault kv/common-app-deploy-secrets.
+      // Per-scope SKIP_* args are forwarded to the Dockerfile build args.
+      // Build and Deploy stages are NEVER skipped — they are the critical path.
       steps {
-        withCredentials([usernamePassword(
-          credentialsId: 'harbor-credentials',
-          usernameVariable: 'HARBOR_USER',
-          passwordVariable: 'HARBOR_PASS'
-        )]) {
-          sh '''
-            echo "${HARBOR_PASS}" | docker login ${HARBOR_REGISTRY} \
-              -u ${HARBOR_USER} --password-stdin
-            docker build \
-              --build-arg SKIP_TESTS=${SKIP_TESTS} \
-              -t ${FULL_IMAGE} \
-              -t ${LATEST_IMAGE} \
+        withVault(
+          configuration: [
+            vaultUrl: 'https://vault.rmwhs.space',
+            vaultCredentialId: 'vault-auth-token'
+          ],
+          vaultSecrets: [[
+            path: 'kv/common-app-deploy-secrets',
+            secretValues: [
+              [envVar: 'HARBOR_USER', vaultKey: 'harbor_username'],
+              [envVar: 'HARBOR_PASS', vaultKey: 'harbor_password']
+            ]
+          ]]
+        ) {
+          sh """
+            echo "\${HARBOR_PASS}" | docker login \${HARBOR_REGISTRY} \\
+              -u \${HARBOR_USER} --password-stdin
+            docker build \\
+              --build-arg SKIP_UNIT_TESTS=${params.SKIP_UNIT_TESTS} \\
+              --build-arg SKIP_INTEGRATION_TESTS=${params.SKIP_INTEGRATION_TESTS} \\
+              -t \${FULL_IMAGE} \\
+              -t \${LATEST_IMAGE} \\
               .
-          '''
+          """
         }
       }
     }
@@ -958,7 +1128,7 @@ data:
         Time_Keep   On
 ```
 
-> OpenSearch credentials for Fluent Bit should be stored as a Kubernetes secret injected by the pipeline using the `opensearch-credentials` Jenkins credential ID. Never hardcode them in the ConfigMap.
+> OpenSearch credentials for Fluent Bit are sourced from `kv/common-app-deploy-secrets` in Vault (`opensearch_username` / `opensearch_password`). The `Apply App Secret` pipeline stage injects them into the `opensearch-credentials` Kubernetes secret in the app namespace. Never hardcode them in the ConfigMap.
 
 #### Sidecar Container Spec (add to Deployment)
 ```yaml
@@ -967,7 +1137,7 @@ data:
   image: fluent/fluent-bit:3.2
   envFrom:
   - secretRef:
-      name: opensearch-credentials   # contains OPENSEARCH_USER and OPENSEARCH_PASS
+      name: opensearch-credentials   # injected by pipeline from kv/common-app-deploy-secrets
   volumeMounts:
   - name: app-logs
     mountPath: /logs
@@ -1004,6 +1174,216 @@ data:
 | Tempo HTTP | `tempo.monitoring.svc.cluster.local:4318` | Trace ingestion (HTTP) |
 | Grafana | `https://grafana.rmwhs.space` | Dashboards |
 | OpenSearch Dashboards | `https://opensearch-dashboards.rmwhs.space` | Log analytics |
+
+---
+
+## Email (Mailpit)
+
+Mailpit is a shared SMTP catch-all for the cluster. Every email sent to it is captured and visible in the web UI — nothing is forwarded externally unless a relay is explicitly configured.
+
+| Purpose | Address |
+|---------|---------|
+| SMTP (send) | `email-mailpit.email-mailpit.svc.cluster.local:1025` |
+| Web UI (view) | `https://email-mailpit.rmwhs.space` |
+| REST API | `https://email-mailpit.rmwhs.space/api/v1` |
+
+> SMTP on port 1025 is unencrypted — traffic stays inside the cluster. Do not expose it externally.
+
+### Configuring Your App to Send Email
+
+Non-sensitive SMTP connection details go in the ConfigMap. Credentials go in the Kubernetes secret, sourced from Vault `kv/common-app-deploy-secrets` (`mailpit_user` / `mailpit_password`).
+
+```yaml
+# k8s/configmap.yaml
+data:
+  SMTP_HOST: "email-mailpit.email-mailpit.svc.cluster.local"
+  SMTP_PORT: "1025"
+  SMTP_FROM: "noreply@your-app.rmwhs.space"
+```
+
+Pull Mailpit credentials from `kv/common-app-deploy-secrets` in the `Apply App Secret` pipeline stage alongside Harbor and OpenSearch:
+
+```groovy
+withVault(
+  configuration: [vaultUrl: 'https://vault.rmwhs.space', vaultCredentialId: 'vault-auth-token'],
+  vaultSecrets: [[
+    path: 'kv/common-app-deploy-secrets',
+    secretValues: [
+      [envVar: 'HARBOR_USER',      vaultKey: 'harbor_username'],
+      [envVar: 'HARBOR_PASS',      vaultKey: 'harbor_password'],
+      [envVar: 'OPENSEARCH_USER',  vaultKey: 'opensearch_username'],
+      [envVar: 'OPENSEARCH_PASS',  vaultKey: 'opensearch_password'],
+      [envVar: 'MAILPIT_USER',     vaultKey: 'mailpit_user'],
+      [envVar: 'MAILPIT_PASSWORD', vaultKey: 'mailpit_password'],
+    ]
+  ]]
+) {
+  sh '''
+    kubectl create secret generic ${IMAGE_NAME}-secret \
+      --from-literal=MAILPIT_USER=${MAILPIT_USER} \
+      --from-literal=MAILPIT_PASSWORD=${MAILPIT_PASSWORD} \
+      ... \
+      --namespace=${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+  '''
+}
+```
+
+Reference them in the Deployment from the secret — never from the ConfigMap:
+
+```yaml
+# k8s/deployment.yaml
+envFrom:
+  - configMapRef:
+      name: your-app-config   # SMTP_HOST, SMTP_PORT, SMTP_FROM
+env:
+  - name: SMTP_USER
+    valueFrom:
+      secretKeyRef:
+        name: myapp-secret
+        key: MAILPIT_USER
+  - name: SMTP_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: myapp-secret
+        key: MAILPIT_PASSWORD
+```
+
+### Framework Examples
+
+#### Node.js — Nodemailer
+
+```javascript
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: parseInt(process.env.SMTP_PORT),
+  secure: false,
+  auth: {
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASSWORD,
+  },
+});
+
+await transporter.sendMail({
+  from: process.env.SMTP_FROM,
+  to: 'user@example.com',
+  subject: 'Hello',
+  text: 'Message body',
+});
+```
+
+#### Python — smtplib
+
+```python
+import smtplib, os
+from email.mime.text import MIMEText
+
+def send_email(to, subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = os.environ['SMTP_FROM']
+    msg['To'] = to
+    with smtplib.SMTP(os.environ['SMTP_HOST'], int(os.environ['SMTP_PORT'])) as server:
+        server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+        server.sendmail(msg['From'], [to], msg.as_string())
+```
+
+#### Python — Django
+
+```python
+# settings.py
+EMAIL_BACKEND      = 'django.core.mail.backends.smtp.EmailBackend'
+EMAIL_HOST         = os.environ.get('SMTP_HOST', 'email-mailpit.email-mailpit.svc.cluster.local')
+EMAIL_PORT         = int(os.environ.get('SMTP_PORT', 1025))
+EMAIL_HOST_USER    = os.environ.get('SMTP_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
+EMAIL_USE_TLS      = False
+EMAIL_USE_SSL      = False
+DEFAULT_FROM_EMAIL = os.environ.get('SMTP_FROM', 'noreply@rmwhs.space')
+```
+
+#### Go — net/smtp
+
+```go
+func sendEmail(to, subject, body string) error {
+    host := os.Getenv("SMTP_HOST")
+    port := os.Getenv("SMTP_PORT")
+    from := os.Getenv("SMTP_FROM")
+    auth := smtp.PlainAuth("", os.Getenv("SMTP_USER"), os.Getenv("SMTP_PASSWORD"), host)
+    msg := []byte("From: " + from + "\r\nTo: " + to + "\r\nSubject: " + subject + "\r\n\r\n" + body + "\r\n")
+    return smtp.SendMail(host+":"+port, auth, from, []string{to}, msg)
+}
+```
+
+#### PHP — PHPMailer
+
+```php
+$mail = new PHPMailer();
+$mail->isSMTP();
+$mail->Host       = getenv('SMTP_HOST');
+$mail->Port       = (int) getenv('SMTP_PORT');
+$mail->SMTPAuth   = true;
+$mail->Username   = getenv('SMTP_USER');
+$mail->Password   = getenv('SMTP_PASSWORD');
+$mail->SMTPSecure = false;
+$mail->setFrom(getenv('SMTP_FROM'));
+```
+
+#### Laravel
+
+```ini
+# .env / Kubernetes ConfigMap (non-sensitive) + Secret (credentials)
+MAIL_MAILER=smtp
+MAIL_HOST=email-mailpit.email-mailpit.svc.cluster.local
+MAIL_PORT=1025
+MAIL_USERNAME=${SMTP_USER}
+MAIL_PASSWORD=${SMTP_PASSWORD}
+MAIL_ENCRYPTION=null
+MAIL_FROM_ADDRESS=noreply@rmwhs.space
+```
+
+#### Ruby — Mail gem
+
+```ruby
+Mail.defaults do
+  delivery_method :smtp,
+    address:              ENV['SMTP_HOST'],
+    port:                 ENV['SMTP_PORT'].to_i,
+    user_name:            ENV['SMTP_USER'],
+    password:             ENV['SMTP_PASSWORD'],
+    enable_starttls_auto: false
+end
+```
+
+#### Rails
+
+```ruby
+# config/environments/production.rb
+config.action_mailer.delivery_method = :smtp
+config.action_mailer.smtp_settings = {
+  address:  ENV.fetch('SMTP_HOST', 'email-mailpit.email-mailpit.svc.cluster.local'),
+  port:     ENV.fetch('SMTP_PORT', 1025).to_i,
+  user_name:     ENV['SMTP_USER'],
+  password:      ENV['SMTP_PASSWORD'],
+  authentication: :plain,
+}
+```
+
+### Viewing Captured Emails
+
+Open `https://email-mailpit.rmwhs.space` — all messages appear here regardless of the `To` address. Nothing is delivered to real inboxes.
+
+```bash
+# REST API
+curl https://email-mailpit.rmwhs.space/api/v1/messages       # list
+curl https://email-mailpit.rmwhs.space/api/v1/message/<id>   # get by ID
+curl -X DELETE https://email-mailpit.rmwhs.space/api/v1/messages  # delete all
+```
+
+### Notes
+
+- **All email is captured.** Mailpit does not forward messages to external addresses unless SMTP relay is explicitly enabled on the Mailpit deployment.
+- **No TLS on port 1025.** Traffic stays inside the cluster; TLS termination is not needed on the internal SMTP connection.
+- **Message retention.** Keeps the last 500 messages by default (configurable via `apps/email-mailpit/values.yaml` → `messages.maxMessages`).
 
 ---
 
@@ -1303,6 +1683,7 @@ spec:
 | `otel-demo` | OpenTelemetry demo app |
 | `jenkins-agents` | Ephemeral Jenkins build pods |
 | `ingress-nginx` | nginx-external ingress controller |
+| `email-mailpit` | Mailpit shared SMTP catch-all |
 | `<your-app>` | Each app gets its own dedicated namespace |
 
 ---
@@ -1323,3 +1704,58 @@ Format: `<service>.<namespace>.svc.cluster.local:<port>`
 | OpenSearch | `opensearch.monitoring.svc.cluster.local:9200` |
 | Tempo gRPC | `tempo.monitoring.svc.cluster.local:4317` |
 | Tempo HTTP | `tempo.monitoring.svc.cluster.local:4318` |
+| Mailpit SMTP | `email-mailpit.email-mailpit.svc.cluster.local:1025` |
+| Mailpit UI | `https://email-mailpit.rmwhs.space` |
+
+---
+
+## Industry Best Practices & Standards
+
+### The Core Philosophy: Decoupling
+
+Enterprise systems architecture decouples the **application layer** from the **data layer**. This produces workloads that scale, fail, and release independently — each component owns its own lifecycle.
+
+**Why separate pods?**
+
+- **Independent scalability** — stateless application tiers scale horizontally without the complexity of scaling a stateful database tier.
+- **Fault isolation** — an application crash (e.g., memory leak) does not threaten database availability or data integrity.
+- **Release velocity** — application updates deploy multiple times per day without touching the database pod.
+
+### Standard Deployment Models
+
+| Feature | Application (Stateless) | Database (Stateful) |
+|:--------|:------------------------|:--------------------|
+| **Controller** | `Deployment` | `StatefulSet` |
+| **Storage** | Ephemeral or shared (NFS / S3) | Persistent (block storage / local PV) |
+| **Network ID** | Dynamic IP (ClusterIP) | Stable hostname (ordinal index) |
+| **Backup strategy** | Code-based (GitOps) | Snapshot / WAL-based |
+
+### When to Use Multi-Container Pods (Sidecars)
+
+Multi-container pods are reserved for **helper processes** that share the same lifecycle as the main application. Do not co-locate independent services in a single pod.
+
+| Pattern | Examples |
+|:--------|:---------|
+| Log forwarders | Fluent Bit, Fluentd, Logstash agents |
+| Proxies | Cloudflare Tunnel, Envoy (service mesh), auth proxies |
+| Secret management | Vault agent sidecar injectors (secrets via shared volume) |
+
+### Best Practices Summary
+
+| Category | Standard Practice |
+|:---------|:-----------------|
+| Pod architecture | One functional unit per pod (decoupled) |
+| Scaling strategy | Independent horizontal scaling per layer |
+| Lifecycle management | Stateless → `Deployment`; Stateful → `StatefulSet` |
+| Resource allocation | Isolate by workload type (CPU-bound vs. I/O-bound) |
+| Secrets | Externalized via Vault (pipeline injection) — never hardcoded |
+| Configuration | Decoupled from image via `ConfigMap` |
+| Connectivity | Internal DNS (service discovery) over localhost |
+| Sidecar usage | Only for helper tasks: logging, proxies, auth |
+
+### Security & Configuration Standards
+
+- **Secrets** — never hardcode credentials. Use Vault injection at the pipeline level (the standard for this cluster). See [Secrets Management](#secrets-management).
+- **Environment** — use `envFrom` to map ConfigMaps and Secrets for cleaner deployment manifests.
+- **Probes** — always implement `liveness` and `readiness` probes so traffic only reaches healthy pods. Omitting probes means Kubernetes cannot distinguish a crashed pod from a starting one.
+
