@@ -6,6 +6,40 @@ Use this document alongside your project's `PROJECT.md` and `.claude/CLAUDE.md` 
 
 > **Security rule:** Never hardcode credentials, passwords, or secrets in any file — including Jenkinsfiles, manifests, shell scripts, or documentation. **Vault is the standard for all app secrets.** See the [Secrets Management](#secrets-management) section.
 
+## Standards, Exceptions, and Ownership
+
+This document is **opinionated by design**. The patterns here represent the stable, repeatable baseline that makes rapid onboarding and predictable deployments possible. Following them means an app works correctly out of the box, integrates with all platform tooling, and can be maintained by anyone familiar with this cluster.
+
+**Apps are permitted to deviate from any non-foundational pattern**, provided the team owns the exception and it does not break cluster or CI/CD stability for others.
+
+### What is non-negotiable (foundational)
+
+These rules exist to protect cluster stability and cannot be overridden by an individual app:
+
+- **No hardcoded secrets** — all credentials via Vault, no exceptions.
+- **Use `longhorn-apps` for databases and caches** — `nfs-client` is not acceptable for stateful app workloads; latency causes failures.
+- **App namespaces are isolated** — apps may not reference or modify resources in other app namespaces.
+- **Images pushed to Harbor** — no pulling from external registries at deploy time (Trivy scan requirement).
+- **`dedicated=apps:NoSchedule` toleration + `nodeSelector: rmw-home-server`** for all app workloads — the worker node taint enforces separation between platform services and apps.
+- **Build and Deploy stages are never skipped** — the pipeline exists to build and deploy; gates must not block these two stages.
+
+### What is optional and overridable
+
+Apps may choose their own approach for anything not listed above. Examples:
+
+- **Pipeline stages**: add, remove, or reorder stages beyond the required Build and Deploy. An app that doesn't need migrations can omit the `Run Migrations` stage entirely.
+- **Resource limits**: the templates show reasonable defaults; apps with known traffic profiles may tune these as needed.
+- **Deployment strategy** (`RollingUpdate` vs `Recreate`): apps with single-replica stateful processes may prefer `Recreate`.
+- **Probes**: the path and port for readiness/liveness probes should be adjusted to match the actual health endpoint of the app.
+- **Extra init containers**: apps may add init containers beyond the db-migrate pattern.
+- **Additional manifests**: apps may add any manifests not in the standard template (CronJobs, HorizontalPodAutoscalers, etc.).
+
+### Owning an exception
+
+If your app deviates from a template pattern, document it in the app repo's `PROJECT.md` or `.claude/CLAUDE.md` so future maintainers understand the intent. An undocumented deviation looks like a bug; a documented one is a decision.
+
+---
+
 ## Naming Convention
 
 All app identifiers — namespace, image name, Vault path, Kubernetes secret name, SonarQube project key, and subdomain — must be **specific and unique** to avoid collisions across apps. Generic names like `wordpress` or `blog` are not acceptable since multiple instances may exist.
@@ -147,6 +181,52 @@ vault kv put kv/myapp \
   db_name="..."
 ```
 
+### Step 1b — Vault Secrets Bootstrap Script
+
+Rather than entering secrets manually via the UI or CLI, use `scripts/vault-put-secrets.sh` to generate and upload them in one step. The script accepts `VAULT_TOKEN` and `VAULT_ADDR` as positional arguments and falls back to the environment variables exported in `~/.zprofile`. It fails silently if neither source provides a value — no error, no output.
+
+```bash
+#!/usr/bin/env bash
+# scripts/vault-put-secrets.sh
+# Usage:
+#   ./scripts/vault-put-secrets.sh                    # uses $VAULT_TOKEN and $VAULT_ADDR from env
+#   ./scripts/vault-put-secrets.sh <token> <addr>     # explicit values override env
+
+_VAULT_TOKEN="${1:-${VAULT_TOKEN:-}}"
+_VAULT_ADDR="${2:-${VAULT_ADDR:-}}"
+
+# Fail silently — prerequisite values are missing
+if [ -z "$_VAULT_TOKEN" ] || [ -z "$_VAULT_ADDR" ]; then
+  exit 0
+fi
+
+APP_NAME="myapp"   # ← replace with IMAGE_NAME / K8S_NAMESPACE value
+
+export VAULT_TOKEN="$_VAULT_TOKEN"
+export VAULT_ADDR="$_VAULT_ADDR"
+
+# Generate UUIDs for unique values.
+# Replace a UUID with a fixed value only when the secret must stay stable
+# across runs (e.g., a password shared with an existing external database).
+SECRET_KEY="$(uuidgen)"
+DB_PASSWORD="$(uuidgen)"
+DB_USER="appuser"
+DB_NAME="appdb"
+
+echo "Writing secrets to kv/${APP_NAME} ..."
+vault kv put "kv/${APP_NAME}" \
+  secret_key="${SECRET_KEY}" \
+  db_password="${DB_PASSWORD}" \
+  db_user="${DB_USER}" \
+  db_name="${DB_NAME}"
+
+echo "Done."
+```
+
+> `uuidgen` ships with macOS and most Linux distributions. Re-running this script rotates all UUID-backed secrets — do not run it against a live environment unless credential rotation is intentional.
+
+---
+
 ### Step 2 — Pull Secrets in the Jenkinsfile with `withVault`
 
 Use the `withVault` step to inject secrets as environment variables at pipeline runtime:
@@ -228,12 +308,12 @@ Apps that need to read secrets from Vault at runtime (not just at deploy time) c
 
 **How to wire it up:**
 
-1. In the `Apply App Secret` stage, pull `vault-auth-token` via `withCredentials` and include it in the `kubectl create secret` call:
+1. In the `Apply App Secret` stage, pull `vault-token` via `withCredentials` and include it in the `kubectl create secret` call:
 
 ```groovy
 stage('Apply App Secret') {
   steps {
-    withCredentials([string(credentialsId: 'vault-auth-token', variable: 'VAULT_TOKEN')]) {
+    withCredentials([string(credentialsId: 'vault-token', variable: 'VAULT_TOKEN')]) {
       withVault(/* ... existing withVault config ... */) {
         sh '''
           kubectl create secret generic ${IMAGE_NAME}-secret \
@@ -283,7 +363,8 @@ Jenkins credentials are reserved for platform-level access. App secrets go in Va
 
 | Credential ID | Type | Used For |
 |--------------|------|---------|
-| `vault-auth-token` | Secret Text | Authenticating `withVault` calls |
+| `vault-auth-token` | Vault Token Credential | `withVault(vaultCredentialId: 'vault-auth-token')` — secret injection into pipeline env |
+| `vault-token` | Secret Text | `withCredentials([string(...)])` — raw token for direct Vault API calls (`curl -H "X-Vault-Token: ..."`) |
 | `harbor-credentials` | Username/Password | Pre-configured imagePullSecret in `jenkins-agents` namespace (platform use only) |
 | `gitlab-root-token` | Username/Password | GitLab API access and repo cloning |
 | `sonarqube-token` | Secret Text | SonarQube analysis authentication |
@@ -336,27 +417,61 @@ type: Opaque
 
 ### Storage Classes
 
-| Class | Provisioner | Default | Backend |
-|-------|-------------|---------|---------|
-| `nfs-client` | nfs-subdir-external-provisioner | ✅ Yes | Synology NAS — `/volume1/kubernetes/volumes` |
-| `local-path` | rancher.io/local-path | ❌ No | Local disk — **deprecated, do not use** |
+| Class | Provisioner | Node | Backend | Use For |
+|-------|-------------|------|---------|---------|
+| `longhorn` | driver.longhorn.io | Optiplex-9020 (control plane) | Internal SSD | DevSecOps stack databases and caches (GitLab, Harbor, Jenkins, Vault, etc.) |
+| `longhorn-apps` | driver.longhorn.io | rmw-home-server (worker) | Internal SSD | App workload databases, caches, and persistent app data |
+| `nfs-client` | nfs-subdir-external-provisioner | Any | Synology NAS | Static content, large blobs, shared/multi-reader files |
+| `local-path` | rancher.io/local-path | Any | Local disk | **Deprecated — do not use** |
 
-**Always use `nfs-client` for new PVCs.** All application storage lives on the NAS for centralized backup and replication. Omitting `storageClassName` is fine since `nfs-client` is the default.
+> `nfs-client` is the cluster default (omitting `storageClassName` resolves to it), but you should always set it explicitly.
 
-### PVC Example
+### When to Use Each Class
+
+**Use `longhorn-apps` for app workloads on the worker node:**
+- PostgreSQL, MySQL, and other relational databases
+- Redis and other caches
+- Any PVC for workloads scheduled on `rmw-home-server`
+- Requires the standard app tolerations and `nodeSelector: kubernetes.io/hostname: rmw-home-server`
+
+**Use `longhorn` for DevSecOps stack workloads on the control plane:**
+- Only used by platform-managed apps (GitLab, Harbor, Vault, Jenkins, Prometheus, etc.)
+- App pipelines should never need to reference this class directly
+
+**Use `nfs-client` for shared or large-object storage:**
+- WordPress `wp-content` directories or other large static file trees
+- Any PVC that needs to be mounted by multiple pods simultaneously (`ReadWriteMany`)
+- Trivy server vulnerability DB cache (large, infrequently written, tolerates NFS latency)
+
+> **Never use `nfs-client` for databases or caches.** NFS latency is unsuitable for database WAL writes and cache operations. Always use `longhorn-apps` for those.
+
+### PVC Example (App Workloads)
+
 ```yaml
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: myapp-data
+  name: myapp-postgres-pvc
   namespace: myapp
 spec:
   accessModes:
     - ReadWriteOnce
-  storageClassName: nfs-client
+  storageClassName: longhorn-apps
   resources:
     requests:
       storage: 10Gi
+```
+
+> **PVC immutability warning:** `storageClassName` and `resources.requests.storage` are immutable after a PVC is created. `kubectl apply` on a changed `storageClassName` produces a silent no-op or an immutable field rejection — the PVC is **not** re-created. To change either field you must: (1) scale down all pods using the PVC, (2) delete the PVC, (3) re-apply. Data is lost unless you snapshot or backup first.
+
+> **Longhorn `subPath` requirement:** Longhorn provisions raw ext4 volumes. When a pod mounts a fresh Longhorn volume directly at the container data directory (e.g. `/var/lib/postgresql/data`), the `lost+found` directory at the filesystem root causes PostgreSQL and MySQL to refuse to initialize. **Always add `subPath: pgdata` to PostgreSQL volumeMounts and `subPath: mysql` to MySQL volumeMounts.** The templates below already include this. Omitting it is a silent failure that only appears when the volume is fresh (after recreation).
+
+```yaml
+# Correct — required for all Longhorn-backed postgres/mysql
+volumeMounts:
+- name: postgres-data
+  mountPath: /var/lib/postgresql/data
+  subPath: pgdata          # ← prevents lost+found collision on fresh Longhorn volumes
 ```
 
 ---
@@ -578,6 +693,170 @@ RUN if [ "$SKIP_INTEGRATION_TESTS" != "true" ]; then go test ./integration/...; 
 
 > All `SKIP_*` args default to `false` — every test scope runs by default. Skipping is for **debug iterations only.** Never merge or deploy an image built with any test scope skipped. Add only the args that correspond to real test scopes in the app — do not add `SKIP_INTEGRATION_TESTS` to an app that has no integration tests.
 
+### Testing Standards
+
+Every app must ship **comprehensive unit and integration tests** alongside the source code. Tests must cover the critical paths of the application — not just happy paths. The pipeline fails on any test failure before scan, push, or deploy.
+
+#### Unit Test Script
+
+A `scripts/run-unit-tests.sh` script provides a zero-argument way to run unit tests locally without containers. Use this during development for the fastest feedback loop.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# scripts/run-unit-tests.sh — run unit tests locally, no containers required
+
+# Python
+pytest tests/unit/ -v
+
+# Node.js
+# npm run test:unit
+
+# Go
+# go test ./internal/... -v
+```
+
+#### Docker Compose — Full Stack
+
+The `docker-compose.yml` at the repo root must replicate the full deployed stack as closely as possible: app container, database, cache, and any backing services. This is the local development environment and the substrate for integration tests.
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.local          # local-only overrides, never committed
+    environment:
+      DATABASE_URL: postgres://appuser:apppass@postgres:5432/appdb
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: apppass
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+
+volumes:
+  postgres-data:
+```
+
+Add only the services the app actually depends on — omit `redis` if the app has no cache layer.
+
+#### Integration Test Script
+
+`scripts/run-integration-tests.sh` is an all-in-one script: it starts ephemeral containers, waits for them to be healthy, runs the integration suite, then tears everything down. The test exit code is preserved and returned to the caller.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# scripts/run-integration-tests.sh
+# Starts the full stack, runs integration tests, tears down on exit (pass or fail).
+
+COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
+EXIT_CODE=0
+
+cleanup() {
+  echo "--- Tearing down containers ---"
+  docker compose -f "$COMPOSE_FILE" down --volumes --remove-orphans
+}
+trap cleanup EXIT
+
+echo "--- Building and starting stack ---"
+docker compose -f "$COMPOSE_FILE" up -d --build
+
+echo "--- Waiting for services to initialise ---"
+sleep 5
+
+# Wait for postgres to be ready before running tests
+until docker compose -f "$COMPOSE_FILE" exec -T postgres pg_isready -U appuser > /dev/null 2>&1; do
+  echo "Waiting for postgres..."
+  sleep 2
+done
+
+echo "--- Running integration tests ---"
+# Python
+docker compose -f "$COMPOSE_FILE" exec -T app pytest tests/integration/ -v || EXIT_CODE=$?
+
+# Node.js
+# docker compose -f "$COMPOSE_FILE" exec -T app npm run test:integration || EXIT_CODE=$?
+
+# Go
+# docker compose -f "$COMPOSE_FILE" exec -T app go test ./integration/... -v || EXIT_CODE=$?
+
+echo "--- Tests complete (exit code: ${EXIT_CODE}) ---"
+exit "$EXIT_CODE"
+```
+
+> The `trap cleanup EXIT` ensures containers are torn down even when the test run fails or the script is interrupted with Ctrl-C. Extend the `sleep` or add additional `until` health checks for services that take longer to initialise (e.g., Elasticsearch, a JVM service).
+
+#### Dockerfile Build Test Script
+
+`scripts/test-docker-build.sh` verifies the Dockerfile builds successfully end-to-end. It is designed for **AI agent iteration**: all test scopes are skipped by default so build-layer issues (missing dependencies, broken `RUN` steps, bad base images) are isolated from test failures. The agent calls the script, reads the full output, applies a fix, and calls it again until it exits 0.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+# scripts/test-docker-build.sh
+# Verifies the Dockerfile builds to a runnable image.
+# All test scopes default to skipped so build errors are not masked by test failures.
+# Re-enable test scopes explicitly when you want to validate them.
+#
+# Usage:
+#   ./scripts/test-docker-build.sh              # skip all tests (default — fastest iteration)
+#   SKIP_UNIT_TESTS=false ./scripts/test-docker-build.sh   # include unit tests
+#   ./scripts/test-docker-build.sh --no-cache   # force a clean layer rebuild
+
+NO_CACHE_FLAG=""
+if [[ "${1:-}" == "--no-cache" ]]; then
+  NO_CACHE_FLAG="--no-cache"
+fi
+
+IMAGE_TAG="build-test-$(date +%s)"
+APP_NAME="$(basename "$(pwd)")"
+IMAGE_NAME="${APP_NAME}:${IMAGE_TAG}"
+
+echo "=== Dockerfile Build Test ==="
+echo "Image  : ${IMAGE_NAME}"
+echo "No-cache: ${NO_CACHE_FLAG:-off}"
+echo ""
+
+cleanup() {
+  echo ""
+  echo "--- Removing test image ---"
+  docker image rm "${IMAGE_NAME}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+docker build \
+  ${NO_CACHE_FLAG} \
+  --build-arg SKIP_UNIT_TESTS="${SKIP_UNIT_TESTS:-true}" \
+  --build-arg SKIP_INTEGRATION_TESTS="${SKIP_INTEGRATION_TESTS:-true}" \
+  --tag "${IMAGE_NAME}" \
+  .
+
+echo ""
+echo "=== Build succeeded: ${IMAGE_NAME} ==="
+```
+
+Key properties that make this agent-friendly:
+
+- **Exit code is the signal** — 0 means the image was built; non-zero means it failed. The full `docker build` output (layer by layer) is printed to stdout/stderr so the calling agent can read exactly which `RUN` step failed and why.
+- **Tests are off by default** — the agent is iterating on the Dockerfile structure, not the test suite. Set `SKIP_UNIT_TESTS=false` or `SKIP_INTEGRATION_TESTS=false` in the environment to include them.
+- **`--no-cache` is opt-in** — pass it when a dependency change requires a clean fetch; omit it during rapid iteration to keep layer cache hits.
+- **Ephemeral image** — the built image is tagged with a timestamp and removed on exit (pass or fail), leaving no residue between iterations.
+
 ### DinD (Docker-in-Docker) Requirements
 
 All pipelines that build Docker images require a DinD sidecar. Key requirements:
@@ -585,12 +864,12 @@ All pipelines that build Docker images require a DinD sidecar. Key requirements:
 - **`--mtu=1400`** is mandatory in DinD daemon args. k3s overlay network MTU is ~1450; DinD defaults to 1500. The mismatch causes `curl: (35) Connection reset by peer` on large downloads (Helm, OS packages) inside the DinD daemon during image builds.
 - **`DOCKER_TLS_CERTDIR: ""`** disables TLS on the Docker socket — use unencrypted TCP on port 2375 between the builder and DinD containers.
 - The builder container sets `DOCKER_HOST: tcp://localhost:2375`.
-- **Daemon readiness wait: always use `docker --version`, never `docker info`.** `docker info` connects to the daemon and queries running state; it has been observed to hang or fail transiently before the daemon is fully initialized. `docker --version` is a local binary check that exits immediately and reliably signals the CLI is present and the socket is reachable.
+- **Daemon readiness wait: use `docker ps`, not `docker --version` or `docker info`.** `docker --version` is a local binary check only — it exits immediately without touching the daemon socket, so the loop completes before DinD is accepting connections. `docker info` connects to the daemon but can hang transiently during initialization. `docker ps` connects to the daemon, fails fast if it's not up, and does not hang.
 
 ```groovy
 sh '''
     echo "Waiting for Docker daemon..."
-    timeout 30 sh -c 'until docker --version > /dev/null 2>&1; do sleep 1; done'
+    timeout 60 sh -c 'until docker ps > /dev/null 2>&1; do sleep 2; done'
     echo "Docker daemon ready."
 '''
 ```
@@ -623,6 +902,8 @@ Two stages are always mandatory and must not be gated by any parameter:
 Every other stage is optional and should be controlled by a dedicated boolean parameter.
 
 #### Universal parameters (all app pipelines)
+
+**Every app pipeline must declare `SKIP_SONAR`, `SKIP_QUALITY_GATE`, and `SKIP_TRIVY`.** These parameters are not optional — they give operators a consistent, documented way to bypass scans without editing the Jenkinsfile. Pipelines that hardcode scan skipping (via commented-out code or unconditional `exit 0`) instead of using these parameters are non-compliant.
 
 | Parameter | Type | Default | Purpose |
 |-----------|------|---------|---------|
@@ -680,7 +961,7 @@ Trivy runs as a long-lived **server in the `security` namespace**, analogous to 
 |----------|-------|
 | Internal URL | `http://trivy-server.security.svc.cluster.local:4954` |
 | Image | `aquasec/trivy:0.55.2` |
-| Cache | PVC `trivy-server-cache` (10Gi, `nfs-client`) — DB persists across restarts |
+| Cache | PVC `trivy-server-cache` (10Gi, `nfs-client`) — large DB, NFS is acceptable here |
 | Manifests | `apps/security/trivy-server/` (Deployment + Service + PVC) |
 | Argo CD App | `apps/argocd/argocd-trivy-server.yaml` |
 
@@ -979,23 +1260,52 @@ spec:
     stage('Run Migrations') {
       when { expression { params.RUN_MIGRATION } }
       steps {
-        sh '''
-          kubectl apply -f k8s/migration-job.yaml -n ${K8S_NAMESPACE}
-          kubectl wait --for=condition=complete job/db-migrate \
+        sh """
+          # Substitute the job name at pipeline time to avoid cross-app name collisions.
+          sed 's/myapp-db-migrate/${IMAGE_NAME}-db-migrate/g' k8s/migration-job.yaml \
+            | kubectl apply -f - -n ${K8S_NAMESPACE}
+          kubectl wait --for=condition=complete job/${IMAGE_NAME}-db-migrate \
             -n ${K8S_NAMESPACE} --timeout=120s
-          kubectl delete job/db-migrate -n ${K8S_NAMESPACE} --ignore-not-found
-        '''
+        """
+      }
+      post {
+        always {
+          sh "kubectl delete job/${IMAGE_NAME}-db-migrate -n ${K8S_NAMESPACE} --ignore-not-found"
+        }
+      }
+    }
+
+    stage('Seed Database') {
+      when { expression { params.SEED_DB } }
+      steps {
+        sh """
+          sed 's/myapp-db-seed/${IMAGE_NAME}-db-seed/g' k8s/seed-job.yaml \
+            | kubectl apply -f - -n ${K8S_NAMESPACE}
+          kubectl wait --for=condition=complete job/${IMAGE_NAME}-db-seed \
+            -n ${K8S_NAMESPACE} --timeout=120s
+        """
+      }
+      post {
+        always {
+          sh "kubectl delete job/${IMAGE_NAME}-db-seed -n ${K8S_NAMESPACE} --ignore-not-found"
+        }
       }
     }
 
     stage('Deploy to Kubernetes') {
+      // Apply in dependency order: namespace → infrastructure (db, redis) → app
+      // Use --ignore-not-found on optional manifests so the stage doesn't fail
+      // when a manifest is not present for this app.
       steps {
         sh '''
-          kubectl apply -f k8s/configmap.yaml
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/ingress.yaml
-          kubectl apply -f k8s/servicemonitor.yaml
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/postgres.yaml       -n ${K8S_NAMESPACE} --ignore-not-found || true
+          kubectl apply -f k8s/redis.yaml          -n ${K8S_NAMESPACE} --ignore-not-found || true
+          kubectl apply -f k8s/configmap.yaml      -n ${K8S_NAMESPACE}
+          kubectl apply -f k8s/deployment.yaml     -n ${K8S_NAMESPACE}
+          kubectl apply -f k8s/service.yaml        -n ${K8S_NAMESPACE}
+          kubectl apply -f k8s/ingress.yaml        -n ${K8S_NAMESPACE}
+          kubectl apply -f k8s/servicemonitor.yaml -n ${K8S_NAMESPACE} --ignore-not-found || true
           kubectl rollout status deployment/${IMAGE_NAME} \
             -n ${K8S_NAMESPACE} --timeout=300s
         '''
@@ -1014,6 +1324,36 @@ spec:
   }
 }
 ```
+
+---
+
+## New App Bootstrap Checklist
+
+Complete these steps **before the first pipeline run**. Each item has a hard dependency — skipping any one causes a predictable failure mode listed alongside it.
+
+| # | Step | Where | Failure if skipped |
+|---|------|--------|--------------------|
+| 1 | Create Vault path `kv/<IMAGE_NAME>` with all app-specific secrets | `vault.rmwhs.space` or `scripts/vault-put-secrets.sh` | Pipeline fails at `Apply App Secret` stage with Vault 404 |
+| 2 | Create Harbor project `apps` (if not already exists) and verify robot account in `kv/common-app-deploy-secrets` | `harbor.rmwhs.space` | `docker push` fails; `harbor-credentials` secret can't be created |
+| 3 | Create SonarQube project with key matching `SONAR_PROJECT` in the Jenkinsfile | `sonarqube.rmwhs.space` | `Quality Gate` stage fails or times out |
+| 4 | Confirm `kv/common-app-deploy-secrets` contains: `harbor_username`, `harbor_password`, `opensearch_username`, `opensearch_password` | Vault | Multiple stages fail on missing env vars |
+| 5 | Commit all `k8s/` manifests to the app repo (at minimum: `namespace.yaml`, `configmap.yaml`, `deployment.yaml`, `service.yaml`, `ingress.yaml`) | App repo | `Deploy to Kubernetes` stage fails on missing file |
+| 6 | If the app uses a database: commit `k8s/postgres.yaml` and verify `DATABASE_URL` is set in Vault | App repo + Vault | App starts but can't connect to DB; migration job fails |
+| 7 | If the app uses Redis: commit `k8s/redis.yaml` (volatile or persistent variant) | App repo | App crashes on Redis connection refused |
+| 8 | If the app exposes metrics: commit `k8s/servicemonitor.yaml` with label `release: kube-prometheus-stack` | App repo | Prometheus won't scrape the app; no metrics visible in Grafana |
+| 9 | Verify Jenkins pipeline job exists and points to the correct repo/branch | `jenkins.rmwhs.space` | No pipeline to trigger |
+| 10 | Run the pipeline with `RUN_MIGRATION=false` on the first deploy if the DB doesn't exist yet; the migration job will fail if the database hasn't been created | Jenkins | Migration job fails with `FATAL: database does not exist` |
+
+### Common First-Run Errors
+
+| Error | Root cause | Fix |
+|-------|-----------|-----|
+| `Vault responded with 404 for path kv/<name>` | Vault path not created | Run `scripts/vault-put-secrets.sh` or create via Vault UI |
+| `unauthorized: authentication required` on docker push | Harbor credentials wrong or project missing | Check `kv/common-app-deploy-secrets` harbor values; verify Harbor project exists |
+| `Quality gate timeout` | SonarQube project key mismatch | Project key in SonarQube must exactly match `SONAR_PROJECT` |
+| `FATAL: database "<name>" does not exist` | Migration ran before DB was initialized | Deploy once with `RUN_MIGRATION=false`; DB is created by the postgres container on first start |
+| `ImagePullBackOff` | `harbor-credentials` secret not yet created in namespace | `Prepare K8s Namespace & Registry Secret` stage must run successfully first |
+| Pod stuck in `Pending` | Missing tolerations or wrong `nodeSelector` | Ensure `tolerations` + `nodeSelector: kubernetes.io/hostname: rmw-home-server` are in the pod spec |
 
 ---
 
@@ -1106,12 +1446,13 @@ data:
     [OUTPUT]
         Name               opensearch
         Match              myapp
-        Host               opensearch.monitoring.svc.cluster.local
+        Host               opensearch-cluster-master.monitoring.svc.cluster.local
         Port               9200
         # Credentials injected via Kubernetes secret — see opensearch-credentials secret
         HTTP_User          ${OPENSEARCH_USER}
         HTTP_Passwd        ${OPENSEARCH_PASS}
-        tls                Off
+        tls                On
+        tls.verify         Off
         Logstash_Format    On
         Logstash_Prefix    myapp-logs
         Logstash_DateFormat %Y.%m.%d
@@ -1169,7 +1510,7 @@ data:
 | Service | Internal DNS | Purpose |
 |---------|-------------|---------|
 | Prometheus | `kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090` | Metrics storage |
-| OpenSearch | `opensearch.monitoring.svc.cluster.local:9200` | Log storage |
+| OpenSearch | `https://opensearch-cluster-master.monitoring.svc.cluster.local:9200` | Log storage |
 | Tempo gRPC | `tempo.monitoring.svc.cluster.local:4317` | Trace ingestion (OTLP) |
 | Tempo HTTP | `tempo.monitoring.svc.cluster.local:4318` | Trace ingestion (HTTP) |
 | Grafana | `https://grafana.rmwhs.space` | Dashboards |
@@ -1449,9 +1790,17 @@ spec:
     spec:
       imagePullSecrets:
       - name: harbor-credentials
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
       containers:
       - name: myapp
         image: harbor.rmwhs.space/apps/myapp:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
           name: http
@@ -1511,6 +1860,19 @@ spec:
 
 ### PostgreSQL Database
 ```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: myapp-postgres-pvc
+  namespace: myapp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-apps   # block storage on worker SSD — required for databases
+  resources:
+    requests:
+      storage: 10Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1526,6 +1888,13 @@ spec:
       labels:
         app: postgres
     spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
       containers:
       - name: postgres
         image: postgres:15-alpine
@@ -1550,6 +1919,7 @@ spec:
         volumeMounts:
         - name: postgres-data
           mountPath: /var/lib/postgresql/data
+          subPath: pgdata          # required — prevents lost+found collision on fresh Longhorn volumes
         resources:
           requests:
             cpu: 100m
@@ -1557,6 +1927,16 @@ spec:
           limits:
             cpu: 500m
             memory: 512Mi
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "$(POSTGRES_USER)", "-d", "$(POSTGRES_DB)"]
+          initialDelaySeconds: 30
+          periodSeconds: 30
       volumes:
       - name: postgres-data
         persistentVolumeClaim:
@@ -1576,11 +1956,164 @@ spec:
   type: ClusterIP
 ```
 
+### Redis (Volatile — in-memory cache, no persistence)
+
+Use this variant for session caches, rate-limiting counters, and any data that is safe to lose on pod restart.
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        command: ["redis-server", "--save", "", "--appendonly", "no"]
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 15
+          periodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: myapp
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+```
+
+### Redis (Persistent — for job queues and durable state)
+
+Use this variant when Redis data must survive pod restarts (e.g., Celery task queues, BullMQ).
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: myapp-redis-pvc
+  namespace: myapp
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: longhorn-apps
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 15
+          periodSeconds: 30
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: myapp-redis-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: myapp
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+  type: ClusterIP
+```
+
 ### Database Migrations (Init Container)
+
+Use an init container when migration failures should block the Deployment rollout entirely. The init container runs before any app containers start, and the pod stays in `Init:Error` state if the migration fails.
+
 ```yaml
 initContainers:
 - name: db-migrate
   image: harbor.rmwhs.space/apps/myapp:latest
+  imagePullPolicy: Always
   command: ["flask", "db", "upgrade"]   # adjust per framework
   envFrom:
   - configMapRef:
@@ -1593,6 +2126,210 @@ initContainers:
         key: DATABASE_URL
 ```
 
+### Database Migrations (Standalone Job)
+
+Use a standalone `batch/v1 Job` (applied by the Jenkinsfile `Run Migrations` stage) when you want pipeline-visible pass/fail without blocking a Deployment rollout, or when the app does not have a Deployment (e.g. a worker-only service).
+
+The job name must include `${IMAGE_NAME}` to avoid name collisions when multiple apps run pipelines concurrently.
+
+```yaml
+# k8s/migration-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: myapp-db-migrate         # replace myapp with ${IMAGE_NAME} in pipeline
+  namespace: myapp
+spec:
+  ttlSecondsAfterFinished: 300   # auto-cleanup 5 min after completion
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      imagePullSecrets:
+      - name: harbor-credentials
+      containers:
+      - name: db-migrate
+        image: harbor.rmwhs.space/apps/myapp:latest
+        imagePullPolicy: Always
+        command: ["flask", "db", "upgrade"]   # adjust per framework
+        envFrom:
+        - configMapRef:
+            name: myapp-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: myapp-secret
+              key: DATABASE_URL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+```
+
+### Database Seed Job (Optional)
+
+Use a seed job to load fixture or initial data. Gate it with the `SEED_DB` pipeline parameter so it never runs unintentionally.
+
+```yaml
+# k8s/seed-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: myapp-db-seed            # replace myapp with ${IMAGE_NAME} in pipeline
+  namespace: myapp
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: Never
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      imagePullSecrets:
+      - name: harbor-credentials
+      containers:
+      - name: db-seed
+        image: harbor.rmwhs.space/apps/myapp:latest
+        imagePullPolicy: Always
+        command: ["flask", "seed"]            # adjust per framework
+        envFrom:
+        - configMapRef:
+            name: myapp-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: myapp-secret
+              key: DATABASE_URL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+```
+
+### Worker Deployment (Optional)
+
+For apps with background task processing (Celery, RQ, BullMQ, Sidekiq). The worker uses the same image as the main app but with a different command.
+
+```yaml
+# k8s/worker.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-worker
+  namespace: myapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: myapp-worker
+  template:
+    metadata:
+      labels:
+        app: myapp-worker
+    spec:
+      imagePullSecrets:
+      - name: harbor-credentials
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      containers:
+      - name: worker
+        image: harbor.rmwhs.space/apps/myapp:latest
+        imagePullPolicy: Always
+        command: ["celery", "-A", "myapp", "worker", "--loglevel=info"]  # adjust per framework
+        envFrom:
+        - configMapRef:
+            name: myapp-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: myapp-secret
+              key: DATABASE_URL
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+```
+
+### Beat Scheduler Deployment (Optional)
+
+For periodic task scheduling (Celery Beat, cron-style workers). **Must always run with `replicas: 1`** — multiple beat instances will fire duplicate tasks.
+
+```yaml
+# k8s/beat.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: myapp-beat
+  namespace: myapp
+spec:
+  replicas: 1   # NEVER scale above 1 — duplicate beat instances cause duplicate task execution
+  selector:
+    matchLabels:
+      app: myapp-beat
+  template:
+    metadata:
+      labels:
+        app: myapp-beat
+    spec:
+      imagePullSecrets:
+      - name: harbor-credentials
+      tolerations:
+      - key: dedicated
+        operator: Equal
+        value: apps
+        effect: NoSchedule
+      nodeSelector:
+        kubernetes.io/hostname: rmw-home-server
+      containers:
+      - name: beat
+        image: harbor.rmwhs.space/apps/myapp:latest
+        imagePullPolicy: Always
+        command: ["celery", "-A", "myapp", "beat", "--loglevel=info"]   # adjust per framework
+        envFrom:
+        - configMapRef:
+            name: myapp-config
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: myapp-secret
+              key: DATABASE_URL
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+```
+
 ---
 
 ## App Repository Directory Structure
@@ -1602,9 +2339,15 @@ Every app has its own Git repo with this layout:
 ```
 myapp/                               # app repo root
 ├── Jenkinsfile                      # CI/CD pipeline (Standard Jenkinsfile Template)
-├── Dockerfile                       # multi-stage build, runs tests, accepts SKIP_TESTS arg
+├── Dockerfile                       # multi-stage build, runs tests, accepts SKIP_* args
+├── docker-compose.yml               # full stack for local dev and integration tests
 ├── <source code>                    # organized by language convention
 ├── tests/                           # invoked by the Dockerfile's test step
+├── scripts/
+│   ├── test-docker-build.sh         # verify Dockerfile builds; agent-iterable, exits non-zero on failure
+│   ├── run-unit-tests.sh            # run unit tests locally (no containers)
+│   ├── run-integration-tests.sh     # spin up stack, run tests, tear down
+│   └── vault-put-secrets.sh         # bootstrap app secrets in Vault
 └── k8s/                             # Kubernetes manifests
     ├── configmap.yaml               # non-sensitive env vars
     ├── secret.yaml                  # structure template only — no real values
@@ -1701,7 +2444,7 @@ Format: `<service>.<namespace>.svc.cluster.local:<port>`
 | Trivy Server | `trivy-server.security.svc.cluster.local:4954` |
 | Vault | `vault.devops.svc.cluster.local:8200` |
 | Prometheus | `kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090` |
-| OpenSearch | `opensearch.monitoring.svc.cluster.local:9200` |
+| OpenSearch | `https://opensearch-cluster-master.monitoring.svc.cluster.local:9200` |
 | Tempo gRPC | `tempo.monitoring.svc.cluster.local:4317` |
 | Tempo HTTP | `tempo.monitoring.svc.cluster.local:4318` |
 | Mailpit SMTP | `email-mailpit.email-mailpit.svc.cluster.local:1025` |
@@ -1726,7 +2469,7 @@ Enterprise systems architecture decouples the **application layer** from the **d
 | Feature | Application (Stateless) | Database (Stateful) |
 |:--------|:------------------------|:--------------------|
 | **Controller** | `Deployment` | `StatefulSet` |
-| **Storage** | Ephemeral or shared (NFS / S3) | Persistent (block storage / local PV) |
+| **Storage** | Ephemeral or NFS for static/blob content | `longhorn-apps` block storage (worker SSD) |
 | **Network ID** | Dynamic IP (ClusterIP) | Stable hostname (ordinal index) |
 | **Backup strategy** | Code-based (GitOps) | Snapshot / WAL-based |
 
@@ -1758,4 +2501,3 @@ Multi-container pods are reserved for **helper processes** that share the same l
 - **Secrets** — never hardcode credentials. Use Vault injection at the pipeline level (the standard for this cluster). See [Secrets Management](#secrets-management).
 - **Environment** — use `envFrom` to map ConfigMaps and Secrets for cleaner deployment manifests.
 - **Probes** — always implement `liveness` and `readiness` probes so traffic only reaches healthy pods. Omitting probes means Kubernetes cannot distinguish a crashed pod from a starting one.
-
