@@ -22,6 +22,7 @@ These rules exist to protect cluster stability and cannot be overridden by an in
 - **Images pushed to Harbor** — no pulling from external registries at deploy time (Trivy scan requirement).
 - **`dedicated=apps:NoSchedule` toleration + `nodeSelector: rmw-home-server`** for all app workloads — the worker node taint enforces separation between platform services and apps.
 - **Build and Deploy stages are never skipped** — the pipeline exists to build and deploy; gates must not block these two stages.
+- **`replicas: 1` for all app Deployments** — the cluster currently runs a single worker node (`rmw-home-server`) with limited CPU and memory. Every additional replica consumes resources shared with all other apps. Keep every Deployment at 1 replica until additional nodes are added to the cluster. The only exceptions are stateful scheduling components (e.g., Celery Beat) where `replicas: 1` is also mandatory for correctness reasons.
 
 ### What is optional and overridable
 
@@ -1168,8 +1169,8 @@ spec:
               --namespace=${K8S_NAMESPACE} \
               --dry-run=client -o yaml | kubectl apply -f -
             kubectl create secret generic opensearch-credentials \
-              --from-literal=OPENSEARCH_USER=${OPENSEARCH_USER} \
-              --from-literal=OPENSEARCH_PASS=${OPENSEARCH_PASS} \
+              --from-literal=user=${OPENSEARCH_USER} \
+              --from-literal=password=${OPENSEARCH_PASS} \
               --namespace=${K8S_NAMESPACE} \
               --dry-run=client -o yaml | kubectl apply -f -
           '''
@@ -1446,15 +1447,15 @@ data:
     [OUTPUT]
         Name               opensearch
         Match              myapp
-        Host               opensearch-cluster-master.monitoring.svc.cluster.local
-        Port               9200
+        Host               ${OPENSEARCH_HOST}
+        Port               ${OPENSEARCH_PORT}
         # Credentials injected via Kubernetes secret — see opensearch-credentials secret
         HTTP_User          ${OPENSEARCH_USER}
-        HTTP_Passwd        ${OPENSEARCH_PASS}
+        HTTP_Passwd        ${OPENSEARCH_PASSWORD}
         tls                On
         tls.verify         Off
         Logstash_Format    On
-        Logstash_Prefix    myapp-logs
+        Logstash_Prefix    ${OPENSEARCH_INDEX}
         Logstash_DateFormat %Y.%m.%d
         Suppress_Type_Name On
         Retry_Limit        3
@@ -1476,9 +1477,23 @@ data:
 # In containers:
 - name: fluent-bit
   image: fluent/fluent-bit:3.2
-  envFrom:
-  - secretRef:
-      name: opensearch-credentials   # injected by pipeline from kv/common-app-deploy-secrets
+  env:
+  - name: OPENSEARCH_HOST
+    value: opensearch-cluster-master.monitoring.svc.cluster.local
+  - name: OPENSEARCH_PORT
+    value: "9200"
+  - name: OPENSEARCH_INDEX
+    value: myapp-logs
+  - name: OPENSEARCH_USER
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: user
+  - name: OPENSEARCH_PASSWORD
+    valueFrom:
+      secretKeyRef:
+        name: opensearch-credentials
+        key: password
   volumeMounts:
   - name: app-logs
     mountPath: /logs
@@ -1775,7 +1790,7 @@ metadata:
   labels:
     app: myapp
 spec:
-  replicas: 2
+  replicas: 1  # single-node cluster — keep at 1 until more nodes are added
   selector:
     matchLabels:
       app: myapp
