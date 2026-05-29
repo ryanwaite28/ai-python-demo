@@ -190,6 +190,11 @@ spec:
                 script {
                     sh '''
                         kubectl apply -f k8s/postgres-init-configmap.yaml -n ${K8S_NAMESPACE}
+                        # PVC spec is immutable once bound — only create if it doesn't exist yet.
+                        # To change the storage class, manually delete the PVC and re-run the pipeline.
+                        kubectl get pvc postgres-pvc -n ${K8S_NAMESPACE} --ignore-not-found \
+                          | grep -q postgres-pvc \
+                          || kubectl apply -f k8s/postgres-pvc.yaml -n ${K8S_NAMESPACE}
                         kubectl apply -f k8s/postgres.yaml -n ${K8S_NAMESPACE}
                         kubectl rollout status deployment/postgres -n ${K8S_NAMESPACE} --timeout=120s
                     '''

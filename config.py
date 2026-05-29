@@ -29,8 +29,11 @@ class ProductionConfig(Config):
 
 class TestingConfig(Config):
     TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'postgresql://test_user:test_pass@localhost:5432/test_db'
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
+    # Override to remove PostgreSQL-specific connect_args; schema handling done via ATTACH DATABASE in conftest
+    SQLALCHEMY_ENGINE_OPTIONS = {}
     WTF_CSRF_ENABLED = False
+    SESSION_COOKIE_SECURE = False
 
 config = {
     'development': DevelopmentConfig,
