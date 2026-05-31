@@ -22,7 +22,7 @@ These rules exist to protect cluster stability and cannot be overridden by an in
 - **Images pushed to Harbor** — no pulling from external registries at deploy time (Trivy scan requirement).
 - **`dedicated=apps:NoSchedule` toleration + `nodeSelector: rmw-home-server`** for all app workloads — the worker node taint enforces separation between platform services and apps.
 - **Build and Deploy stages are never skipped** — the pipeline exists to build and deploy; gates must not block these two stages.
-- **`replicas: 1` for all app Deployments** — the cluster currently runs a single worker node (`rmw-home-server`) with limited CPU and memory. Every additional replica consumes resources shared with all other apps. Keep every Deployment at 1 replica until additional nodes are added to the cluster. The only exceptions are stateful scheduling components (e.g., Celery Beat) where `replicas: 1` is also mandatory for correctness reasons.
+- **`replicas: 1` for all app Deployments** — the cluster runs a single worker node (`rmw-home-server`) with limited shared resources. All app Deployments must use `replicas: 1` until additional worker nodes are provisioned. Running more than one replica causes `FailedScheduling` events due to insufficient memory/CPU and degrades all other workloads on the node.
 
 ### What is optional and overridable
 
@@ -1483,11 +1483,11 @@ data:
   - name: OPENSEARCH_PORT
     value: "9200"
   - name: OPENSEARCH_INDEX
-    value: myapp-logs
+    value: myapp-logs          # replace myapp with your app identifier
   - name: OPENSEARCH_USER
     valueFrom:
       secretKeyRef:
-        name: opensearch-credentials
+        name: opensearch-credentials   # injected by pipeline from kv/common-app-deploy-secrets
         key: user
   - name: OPENSEARCH_PASSWORD
     valueFrom:
@@ -1790,7 +1790,7 @@ metadata:
   labels:
     app: myapp
 spec:
-  replicas: 1  # single-node cluster — keep at 1 until more nodes are added
+  replicas: 1
   selector:
     matchLabels:
       app: myapp
