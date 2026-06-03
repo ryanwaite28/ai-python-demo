@@ -4,6 +4,8 @@ metadata:
   name: postgres
   namespace: ai-python-demo
 spec:
+  strategy:
+    type: Recreate
   replicas: 1
   selector:
     matchLabels:
