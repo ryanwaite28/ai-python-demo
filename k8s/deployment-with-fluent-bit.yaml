@@ -25,7 +25,7 @@ spec:
         value: apps
         effect: NoSchedule
       nodeSelector:
-        kubernetes.io/hostname: rmw-home-server
+        workload: apps
       imagePullSecrets:
       - name: harbor-credentials
       containers:

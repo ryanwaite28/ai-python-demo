@@ -19,7 +19,7 @@ spec:
         value: apps
         effect: NoSchedule
       nodeSelector:
-        kubernetes.io/hostname: rmw-home-server
+        workload: apps
       containers:
       - name: postgres
         image: postgres:15-alpine
